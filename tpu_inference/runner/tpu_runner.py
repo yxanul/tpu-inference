@@ -846,6 +846,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         self.is_pooling_model: bool = self.model_config.runner_type == "pooling"
         """Generative model or pooling model select different computations."""
+        self._align_mamba_gids: frozenset[int] = frozenset()
         self.enable_continue_decode = self.vllm_config.additional_config.get(
             "enable_continue_decode", False)
         # continue_decode EOS-check interval: how often the fused decode loop
@@ -1363,6 +1364,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
     def _wire_input_batch_mamba_state(self,
                                       kv_cache_config: KVCacheConfig) -> None:
         self.input_batch.has_mamba_layers = kv_cache_config.has_mamba_layers
+        from vllm.v1.kv_cache_interface import MambaSpec
+        self._align_mamba_gids = frozenset(
+            gid for gid, group in enumerate(kv_cache_config.kv_cache_groups)
+            if isinstance(group.kv_cache_spec, MambaSpec)) if (
+                self.kv_cache_manager.actual_mamba_num_blocks is not None
+                and getattr(self.cache_config, "mamba_cache_mode",
+                            "none") == "align") else frozenset()
         if self.kv_cache_manager.actual_mamba_num_blocks is not None:
             self.input_batch.init_mamba_pools(
                 self.kv_cache_manager.actual_mamba_num_blocks)
@@ -3022,6 +3030,22 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                         axis=0,
                         out=block_tables_view[req_offset:req_offset +
                                               _num_reqs])
+
+            if kv_cache_gid in self._align_mamba_gids:
+                # The GDN op clamps slot ids into the mamba state pool, so an
+                # id from a larger pool silently aliases other requests'
+                # states. Fail loudly instead.
+                limit = (self.kv_cache_manager.actual_mamba_num_blocks //
+                         max(dp_size, 1))
+                max_id = int(block_tables_view.max(initial=0))
+                if max_id >= limit:
+                    raise RuntimeError(
+                        f"Mamba block id {max_id} (kv-cache group "
+                        f"{kv_cache_gid}) is outside the {limit}-slot mamba "
+                        "state pool. The scheduler is not using "
+                        "TPUHybridKVCacheCoordinator; its hooks must be "
+                        "installed before the engine core builds the "
+                        "scheduler.")
 
             if self.pcp_preprocessor is not None:
                 # Each request is two fused seqs (head, tail) and the kernel
