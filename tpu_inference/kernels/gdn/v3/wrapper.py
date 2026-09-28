@@ -21,6 +21,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 from tpu_inference.kernels.gdn.v3 import (compute_conv1d, compute_gdn, config,
                                           memory_ref, metadata, vmem_ldst)
+from tpu_inference.kernels.ragged_paged_attention.v3.util import \
+    get_tpu_version
 
 
 def inner_kernel(
@@ -254,6 +256,13 @@ def outer_kernel(
         )
 
     _run()
+
+
+def _pin_to_hbm(x: jax.Array | None) -> jax.Array | None:
+    """Constrains `x` to HBM so XLA cannot place it in CMEM (TPU v4)."""
+    if x is None:
+        return None
+    return pltpu.with_memory_space_constraint(x, pltpu.HBM)
 
 
 @jax.jit(
@@ -523,7 +532,7 @@ def fused_conv1d_gdn(
             in_out_spec = hbm_spec
             input_output_aliases[len(metadata_obj) + 5] = 0
 
-        return pl.pallas_call(
+        kernel = pl.pallas_call(
             functools.partial(outer_kernel, cfg=cfg),
             out_shape=(out_shape, in_conv_state, in_recurrent_state),
             in_specs=(
@@ -545,16 +554,18 @@ def fused_conv1d_gdn(
             ),
             name=cfg.get_kernel_name(),
             metadata=cfg.get_metadata(),
-        )(
-            metadata_obj,
-            qkv,
-            b,
-            a,
-            in_conv_state,
-            in_recurrent_state,
-            in_act,
-            weights,
         )
+        operands = (qkv, b, a, in_conv_state, in_recurrent_state, in_act)
+        if get_tpu_version() == 4:
+            # TPU v4 has CMEM. Inside a larger jit, XLA's memory-space
+            # assignment may place these operands (or the copies it makes for
+            # aliased, non-donated state) in CMEM, but the kernel DMAs them as
+            # HBM refs: the core halts (RuntimeUnexpectedCoreHalt) once a
+            # decode batch spans more than two tiles with >= 2 live sequences
+            # (>= 10 sequences at the default decode tile size). Pin them to
+            # HBM, as RPA v3 does on v7.
+            operands = tuple(_pin_to_hbm(x) for x in operands)
+        return kernel(metadata_obj, *operands, weights)
 
     # The first segment holds verify windows of up to `num_spec_tokens + 1`
     # tokens, or plain 1-token decodes without speculative decoding.
