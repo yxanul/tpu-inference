@@ -403,6 +403,13 @@ def fused_conv1d_gdn(
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
     decode_tile_size = min(decode_tile_size, batch_size)
     mixed_tile_size = min(mixed_tile_size, batch_size)
+    if (get_tpu_version() == 4
+            and jnp.dtype(recurrent_state.dtype).itemsize >= 4):
+        # TPU v4 has 16 MiB of VMEM. With an fp32 recurrent state (e.g.
+        # --mamba-ssm-cache-dtype float32, the Qwen3.5 default) the 64-row
+        # prefill tile overflows it at compile time (CompileTimeScopedVmemOom
+        # for 12 local v-heads of 128x128); 32 rows fit.
+        mixed_tile_size = min(mixed_tile_size, 32)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
 
     if num_spec_tokens > 0:

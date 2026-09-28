@@ -1065,3 +1065,52 @@ class GDNAttentionTest(parameterized.TestCase):
                                    np.asarray(new_states_ref[1])[live],
                                    rtol=2e-2,
                                    atol=2e-2)
+
+    def test_prefill_fp32_state_fits_vmem(self):
+        """Prefill (PER_SEQ) with fp32 recurrent/conv state and 12 v-heads.
+
+        With the default 64-row prefill tile this overflowed TPU v4's 16 MiB
+        VMEM at compile time (CompileTimeScopedVmemOom); v4 now caps the tile.
+        """
+        num_blocks, prefill_len = 5, 500
+        n_kq, n_v, d_k, d_v, kernel_size = 4, 12, 128, 128, 4
+        dim = 2 * n_kq * d_k + n_v * d_v
+        num_tokens = 512
+        rngs = iter(jax.random.split(jax.random.key(1), 10))
+
+        q_loc = jnp.array([0, prefill_len, prefill_len], dtype=jnp.int32)
+        state_indices = jnp.array([1, 0], dtype=jnp.int32)
+        common_kwargs = dict(
+            qkv=jax.random.normal(next(rngs), (num_tokens, dim)),
+            b=jax.random.normal(next(rngs), (num_tokens, n_v)),
+            a=jax.random.normal(next(rngs), (num_tokens, n_v)),
+            conv_state=jnp.zeros((num_blocks, kernel_size - 1, dim),
+                                 jnp.float32),
+            recurrent_state=jnp.zeros((num_blocks, n_v, d_k, d_v),
+                                      jnp.float32),
+            conv_weight=jax.random.normal(next(rngs), (dim, 1, kernel_size)),
+            conv_bias=None,
+            a_log=jax.random.normal(next(rngs), (n_v, )),
+            dt_bias=jax.random.normal(next(rngs), (n_v, )),
+            query_start_loc=q_loc,
+            state_indices=state_indices,
+            distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
+            seq_lens=jnp.array([prefill_len, 0], dtype=jnp.int32),
+            read_state_indices=state_indices,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+        new_states_ref, output_ref = gdn_attention_ref(**common_kwargs)
+        new_states, output = wrapper.fused_conv1d_gdn(**common_kwargs)
+
+        np.testing.assert_allclose(output[:prefill_len],
+                                   output_ref[:prefill_len],
+                                   rtol=2e-2,
+                                   atol=2e-2)
+        np.testing.assert_allclose(new_states[1][1],
+                                   new_states_ref[1][1],
+                                   rtol=2e-2,
+                                   atol=2e-2)
