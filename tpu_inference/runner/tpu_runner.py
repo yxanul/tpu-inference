@@ -72,6 +72,7 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
 from tpu_inference.runner import utils as runner_utils
 from tpu_inference.runner.compilation_manager import CompilationManager
 from tpu_inference.runner.decode_loop import TpuSamplingState, continue_decode
+from tpu_inference.runner import prefix_trace
 from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
 from tpu_inference.runner.kv_cache_manager import KVCacheManager
 from tpu_inference.runner.lora_utils import LoraUtils
@@ -847,6 +848,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.is_pooling_model: bool = self.model_config.runner_type == "pooling"
         """Generative model or pooling model select different computations."""
         self._align_mamba_gids: frozenset[int] = frozenset()
+        self._prefix_tracer = None  # debug: PREFIX_TRACE=1
         self.enable_continue_decode = self.vllm_config.additional_config.get(
             "enable_continue_decode", False)
         # continue_decode EOS-check interval: how often the fused decode loop
@@ -1717,6 +1719,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     scheduler_output) as kv_connector_output:
                 # NOTE(Wenlong): It takes both `input_ids` and `inputs_embeds`,
                 # but one of them would be `None`
+                if prefix_trace.ENABLED:
+                    if self._prefix_tracer is None:
+                        self._prefix_tracer = prefix_trace.PrefixTracer(self)
+                    self._prefix_tracer.before_step(scheduler_output)
                 (self.kv_caches, hidden_states, aux_hidden_states,
                  expert_indices) = self.model_fn(
                      self.state_leaves,
@@ -1732,6 +1738,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                      self.is_last_rank,
                      shared_attention_metadata=shared_attn_metadata,
                  )
+                if prefix_trace.ENABLED and self._prefix_tracer is not None:
+                    self._prefix_tracer.after_step()
             if not self.is_last_rank:
                 assert isinstance(hidden_states, JaxIntermediateTensors)
                 hidden_states.kv_connector_output = kv_connector_output
