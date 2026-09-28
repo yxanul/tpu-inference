@@ -21,6 +21,7 @@ import torch
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 
 from tpu_inference import envs
+from tpu_inference.executors.uniproc_executor import UniProcExecutor
 from tpu_inference.platforms.tpu_platform import TpuPlatform
 
 
@@ -371,7 +372,7 @@ class TestTpuPlatform:
 
         TpuPlatform.check_and_update_config(vllm_config)
 
-        assert vllm_config.parallel_config.distributed_executor_backend == "uni"
+        assert vllm_config.parallel_config.distributed_executor_backend == UniProcExecutor
         assert vllm_config.scheduler_config.disable_chunked_mm_input is False
 
         mock_sharding.from_vllm_config.assert_called_once_with(vllm_config)
@@ -455,8 +456,8 @@ class TestTpuPlatform:
         vllm_config.cache_config = None
         TpuPlatform.check_and_update_config(vllm_config)
 
-        # Fallback behaviour defaults to `uni`
-        assert vllm_config.parallel_config.distributed_executor_backend == "uni"
+        # Fallback behaviour defaults to the TPU uniproc executor
+        assert vllm_config.parallel_config.distributed_executor_backend == UniProcExecutor
 
     @patch("tpu_inference.platforms.tpu_platform.envs.TPU_MULTIHOST_BACKEND",
            "")
