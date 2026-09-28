@@ -359,15 +359,20 @@ class TpuPlatform(Platform):
                     "token interval, so the retained boundaries would not all "
                     "exist. Use 0 (the default).")
 
-        # Hybrid (mamba/linear-attention) models cannot use prefix caching with
-        # speculative decoding because verify windows need consecutive state slots.
+        # Hybrid (mamba/linear-attention) models with prefix caching and
+        # speculative decoding: verify windows checkpoint into the request's
+        # align-mode scratch blocks and the accepted state is committed after
+        # sampling (layers/common/mamba_align_spec.py). Set
+        # TPU_DISABLE_HYBRID_SPEC_PREFIX_CACHE=1 to fall back to disabling
+        # prefix caching.
         if (cache_config and getattr(cache_config, "mamba_cache_mode", "none")
                 == "align"):
-            if vllm_config.speculative_config is not None:
+            if (vllm_config.speculative_config is not None and os.environ.get(
+                    "TPU_DISABLE_HYBRID_SPEC_PREFIX_CACHE", "0") == "1"):
                 logger.warning(
-                    "[tpu_platform] Disabling prefix caching: hybrid "
-                    "(mamba/linear-attention) models do not support cached "
-                    "prefixes with speculative decoding on TPU.")
+                    "[tpu_platform] Disabling prefix caching for a hybrid "
+                    "model with speculative decoding "
+                    "(TPU_DISABLE_HYBRID_SPEC_PREFIX_CACHE=1).")
                 cache_config.enable_prefix_caching = False
                 cache_config.mamba_cache_mode = "none"
                 if (getattr(cache_config, "mamba_block_size", None) is not None

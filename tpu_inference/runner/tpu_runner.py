@@ -53,6 +53,8 @@ from tpu_inference import utils as common_utils
 from tpu_inference.core.sched.utils import DEFAULT_MAX_DECODE_STEPS
 from tpu_inference.layers.common.attention_metadata import (
     AttentionMetadata, GroupedAttentionMetadata, SharedAttentionMetadata)
+from tpu_inference.layers.common.mamba_align_spec import \
+    commit_align_spec_mamba_states
 from tpu_inference.layers.common.sharding import (MESH_AXIS_NAMES,
                                                   MESH_AXIS_NAMES_2D,
                                                   ShardingAxisName,
@@ -879,6 +881,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.is_pooling_model: bool = self.model_config.runner_type == "pooling"
         """Generative model or pooling model select different computations."""
         self._align_mamba_gids: frozenset[int] = frozenset()
+        # (gid, kv-cache indices) of mamba groups whose verify windows are
+        # committed after sampling (align mode + spec decoding).
+        self._align_spec_mamba_groups: tuple[tuple[int, tuple[int, ...]],
+                                             ...] = ()
         self.enable_continue_decode = self.vllm_config.additional_config.get(
             "enable_continue_decode", False)
         # continue_decode EOS-check interval: how often the fused decode loop
@@ -1388,8 +1394,23 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # `base_slot + offset`, which is how rejected draft tokens are
         # rolled back (by selecting the checkpoint of the last accepted
         # token, never by copying state).
+        # With mamba prefix caching ("align" mode) rollback is resolved by
+        # copying the accepted checkpoint after sampling instead (see
+        # `layers/common/mamba_align_spec.py`).
+        self._align_spec_mamba_groups = ()
         if (kv_cache_config.has_mamba_layers
-                and self.speculative_config is not None):
+                and self.speculative_config is not None
+                and self._align_mamba_gids):
+            self._align_spec_mamba_groups = tuple(
+                (gid,
+                 tuple(
+                     sorted({
+                         self.layer_name_to_kvcache_index[name]
+                         for name in
+                         kv_cache_config.kv_cache_groups[gid].layer_names
+                     }))) for gid in sorted(self._align_mamba_gids))
+        elif (kv_cache_config.has_mamba_layers
+              and self.speculative_config is not None):
             mamba_num_blocks = self.kv_cache_manager.actual_mamba_num_blocks
             if mamba_num_blocks is None:
                 mamba_num_blocks = (self.input_batch._mamba_local_slots *
@@ -2263,7 +2284,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                      self.speculative_config.num_speculative_tokens,
                      self.input_batch.vocab_size,
                      self.max_num_reqs // self.dp_size, self.mesh)
-                if self.mamba_slot_read_offsets is not None:
+                if self._align_spec_mamba_groups:
+                    self._commit_align_spec_mamba_states(
+                        attn_metadata, spec_decode_metadata,
+                        mamba_read_offsets)
+                elif self.mamba_slot_read_offsets is not None:
                     if isinstance(attn_metadata, dict):
                         _mamba_state_indices = next(
                             iter(attn_metadata.values())).mamba_state_indices
@@ -2767,6 +2792,46 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 next_tokens_in_tpu, placeholder_num)
         return input
 
+    @property
+    def uses_mamba_spec_decode(self) -> bool:
+        """Spec decoding on a model with mamba layers: the GDN op gets the
+        [decode][verify][prefill] split in `mamba_request_distribution`."""
+        kv_cache_config = getattr(self, "kv_cache_config", None)
+        return (self.speculative_config is not None
+                and kv_cache_config is not None
+                and kv_cache_config.has_mamba_layers)
+
+    def _commit_align_spec_mamba_states(self, attn_metadata,
+                                        spec_decode_metadata,
+                                        num_accepted_drafts) -> None:
+        """Move each verify window's accepted mamba checkpoint (and a block
+        boundary checkpoint it crossed) into the align-mode block layout."""
+        groups = self._align_spec_mamba_groups
+        kv_caches = list(self.kv_caches)
+        states = tuple(
+            tuple(tuple(kv_caches[i]) for i in idxs) for _, idxs in groups)
+        per_group = getattr(attn_metadata, "groups", None)
+        block_tables = tuple(
+            (per_group[gid] if per_group is not None else attn_metadata
+             ).block_tables for gid, _ in groups)
+        seq_lens = (per_group[0]
+                    if per_group is not None else attn_metadata).seq_lens
+        new_states = commit_align_spec_mamba_states(
+            states,
+            block_tables,
+            seq_lens,
+            spec_decode_metadata.draft_lengths,
+            num_accepted_drafts,
+            mesh=self.mesh,
+            block_size=self.cache_config.mamba_block_size)
+        for (_, idxs), group_states in zip(groups, new_states):
+            for i, layer_states in zip(idxs, group_states):
+                # Keep the container type: it is part of model_fn's pytree
+                # signature.
+                kv_caches[i] = type(kv_caches[i])(layer_states)
+        self.kv_caches = (kv_caches if isinstance(self.kv_caches, list) else
+                          type(self.kv_caches)(kv_caches))
+
     def _subtract_num_rejected_tokens(self, seq_lens, positions, req_ids_dp,
                                       scheduled_tokens_per_dp_rank):
         """Apply rejection-count subtraction to seq_lens and positions if needed.
@@ -3192,6 +3257,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                      self.mesh, (request_distribution, mamba_state_indices_cpu,
                                  metadata_blob),
                      sharding=metadata_attn_sharding)
+        elif mamba_request_distribution_cpu is not None:
+            # Align mode with spec decoding: slots come from the block tables,
+            # but the GDN op still needs the [decode][verify] segment split.
+            mamba_state_indices = None
+            (request_distribution, mamba_request_distribution,
+             dev_arrays_payload) = device_array(
+                 self.mesh, (request_distribution,
+                             mamba_request_distribution_cpu, metadata_blob),
+                 sharding=metadata_attn_sharding)
         else:
             mamba_state_indices = None
             mamba_request_distribution = None

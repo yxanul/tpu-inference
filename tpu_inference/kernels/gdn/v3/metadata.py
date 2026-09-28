@@ -27,6 +27,7 @@ def compute_batched_seq_metadata(
     read_offsets: jax.Array,
     end_seq: jax.Array,
     read_indices: jax.Array,
+    spec_state_indices: jax.Array | None = None,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing multiple sequences per tile.
 
@@ -34,7 +35,9 @@ def compute_batched_seq_metadata(
     a single decoded token, or a speculative verify window of up to
     `cfg.window_size` of them. The initial state is read from
     `read_indices[s] + read_offsets[s]` and one state checkpoint per window
-    position is written back to `state_indices[s] + t`.
+    position is written back to `state_indices[s] + t`, or to
+    `spec_state_indices[s, t]` when that [num_seqs, window_size] table is
+    given.
     """
 
     max_seqs = seq_lens.size
@@ -57,9 +60,11 @@ def compute_batched_seq_metadata(
         p_id_is_first_tile=is_valid_seqs,
         p_id_is_last_tile=is_valid_seqs,
         s_idx_has_initial_state=has_initial_state,
-        s_idx_to_state_indices=state_indices,
+        s_idx_to_state_indices=(state_indices if spec_state_indices is None
+                                else spec_state_indices.reshape(-1)),
         s_idx_to_read_offset=read_offsets,
         s_idx_to_read_indices=read_indices,
+        per_position_state_indices=spec_state_indices is not None,
     )
 
 

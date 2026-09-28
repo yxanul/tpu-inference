@@ -466,7 +466,7 @@ class CompilationManager:
         # Match `_prepare_inputs`: the spec-decode mamba fields are set iff
         # the model has mamba layers and spec decoding is enabled.
         mamba_slot_read_offsets = self.runner.mamba_slot_read_offsets
-        if mamba_slot_read_offsets is not None:
+        if self.runner.uses_mamba_spec_decode:
             mamba_request_distribution = device_array(
                 self.runner.mesh,
                 np.array([0, 0, 0] * dp_size, dtype=np.int32),
@@ -1301,6 +1301,7 @@ class CompilationManager:
         self._precompile_extend_logits_simple()
         self._precompile_select_from_array_spec_decode()
         self._precompile_update_mamba_slot_read_offsets()
+        self._precompile_commit_align_spec_mamba_states()
         if self.runner.speculative_config.method == "eagle3":
             self._precompile_eagle3_helpers()
         elif self.runner.speculative_config.method == "dflash":
@@ -1332,6 +1333,68 @@ class CompilationManager:
             read_offsets,
             self.runner.mesh,
         )
+
+    def _precompile_commit_align_spec_mamba_states(self) -> None:
+        groups = self.runner._align_spec_mamba_groups
+        if not groups:
+            return
+        logger.info("Compiling commit_align_spec_mamba_states.")
+        from tpu_inference.layers.common.mamba_align_spec import \
+            commit_align_spec_mamba_states
+        metadata_attn_sharding = NamedSharding(
+            self.runner.mesh, PartitionSpec(ShardingAxisName.BATCH))
+        dp_sharding = NamedSharding(self.runner.mesh,
+                                    PartitionSpec(ShardingAxisName.ATTN_DATA))
+        max_num_reqs = self.runner.max_num_reqs
+        block_tables = tuple(
+            device_array(self.runner.mesh,
+                         np.zeros(max_num_reqs * self.runner.input_batch.
+                                  block_table[gid].max_num_blocks_per_req,
+                                  dtype=np.int32),
+                         sharding=metadata_attn_sharding) for gid, _ in groups)
+        seq_lens = device_array(self.runner.mesh,
+                                np.zeros(max_num_reqs, dtype=np.int32),
+                                sharding=metadata_attn_sharding)
+        num_accepted = self._create_dummy_tensor((max_num_reqs, ),
+                                                 jnp.int32,
+                                                 sharding=dp_sharding)
+
+        def warmup(fn, args, call_kwargs):
+            # The states are donated: run on the live caches and keep the
+            # results (all-zero draft lengths make every copy a no-op).
+            kv_caches = list(self.runner.kv_caches)
+            states = tuple(
+                tuple(tuple(kv_caches[i]) for i in idxs) for _, idxs in groups)
+            out = fn(states, *args[1:], **call_kwargs)
+            for (_, idxs), group_states in zip(groups, out):
+                for i, layer_states in zip(idxs, group_states):
+                    kv_caches[i] = type(kv_caches[i])(layer_states)
+            self.runner.kv_caches = (kv_caches if isinstance(
+                self.runner.kv_caches, list) else type(
+                    self.runner.kv_caches)(kv_caches))
+            return out
+
+        states = tuple(
+            tuple(tuple(self.runner.kv_caches[i]) for i in idxs)
+            for _, idxs in groups)
+        for num_reqs in self.runner.num_reqs_paddings:
+            draft_lengths = self._create_dummy_tensor((num_reqs, ),
+                                                      jnp.int32,
+                                                      sharding=dp_sharding)
+            self._run_compilation(
+                f"worker{self.runner.rank} commit_align_spec_mamba_states",
+                commit_align_spec_mamba_states,
+                states,
+                block_tables,
+                seq_lens,
+                draft_lengths,
+                num_accepted,
+                call_kwargs=dict(
+                    mesh=self.runner.mesh,
+                    block_size=self.runner.cache_config.mamba_block_size),
+                warmup_handler=warmup,
+                num_reqs=num_reqs,
+            )
 
     def _precompile_select_from_array_spec_decode(self) -> None:
         logger.info("Compiling select_from_array with different input shapes.")
@@ -1575,7 +1638,7 @@ class CompilationManager:
         # `dataclasses.replace`, so the spec-decode mamba fields (unused by
         # the pure-attention drafter) are still part of its pytree signature.
         eagle3_mamba_slot_read_offsets = self.runner.mamba_slot_read_offsets
-        if eagle3_mamba_slot_read_offsets is not None:
+        if self.runner.uses_mamba_spec_decode:
             eagle3_mamba_request_distribution = device_array(
                 self.runner.mesh,
                 np.array([0, 0, 0] * dp_size, dtype=np.int32),
@@ -1724,7 +1787,7 @@ class CompilationManager:
         # See the eagle3 precompile above: the drafter metadata inherits the
         # spec-decode mamba fields from the target metadata via `replace`.
         mamba_slot_read_offsets = self.runner.mamba_slot_read_offsets
-        if mamba_slot_read_offsets is not None:
+        if self.runner.uses_mamba_spec_decode:
             mamba_request_distribution = device_array(self.runner.mesh,
                                                       np.array([0, 0, 0] *
                                                                dp_size,
@@ -1858,7 +1921,7 @@ class CompilationManager:
         else:
             dflash_mamba_state_indices = None
         dflash_mamba_slot_read_offsets = self.runner.mamba_slot_read_offsets
-        if dflash_mamba_slot_read_offsets is not None:
+        if self.runner.uses_mamba_spec_decode:
             dflash_mamba_request_distribution = device_array(
                 self.runner.mesh,
                 np.array([0, 0, 0] * dp_size, dtype=np.int32),

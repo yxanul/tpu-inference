@@ -632,6 +632,125 @@ class GDNAttentionTest(parameterized.TestCase):
                 atol=2e-2,
                 err_msg=f"recurrent checkpoint mismatch at slot {slot}")
 
+    def test_spec_mode_per_position_slots(self):
+        """`spec_state_indices`: window checkpoint t of sequence s lands in
+        the scattered slot `spec_state_indices[s, t]` (mamba prefix caching's
+        block-table columns) and the initial state is read from
+        `read_state_indices[s]`. Checked against the contiguous-slot SPEC
+        reference on a relabelled copy of the state."""
+        kq_head_dim = 128
+        v_head_dim = 128
+        n_kq = 2
+        n_v = 8
+        kernel_size = 4
+        num_spec_tokens = 3
+        window = num_spec_tokens + 1
+        spec_lengths = [4, 2, 1, 3, 4]
+        num_seqs = len(spec_lengths)
+        num_tokens = sum(spec_lengths)
+        q_loc = jnp.array(np.concatenate([[0], np.cumsum(spec_lengths)]),
+                          dtype=jnp.int32)
+        distribution = jnp.array([num_seqs, num_seqs, num_seqs],
+                                 dtype=jnp.int32)
+
+        # Scattered, disjoint slots: the read slot of each sequence may also
+        # be its checkpoint-0 slot (in-place decode), as in align mode.
+        num_blocks = 64
+        perm = np.random.default_rng(7).permutation(np.arange(1, num_blocks))
+        spec_slots = perm[:num_seqs * window].reshape(num_seqs, window)
+        read_slots = perm[num_seqs * window:num_seqs * window + num_seqs]
+        read_slots[1] = spec_slots[1, 0]
+
+        rngs = iter(jax.random.split(jax.random.key(5), 12))
+        conv_dim = (n_kq * kq_head_dim) * 2 + n_v * v_head_dim
+        mixed_qkv = jax.random.normal(next(rngs), (num_tokens, conv_dim))
+        b = jax.random.normal(next(rngs), (num_tokens, n_v))
+        a = jax.random.normal(next(rngs), (num_tokens, n_v))
+        conv_state = jax.random.normal(next(rngs),
+                                       (num_blocks, kernel_size - 1, conv_dim))
+        recurrent_state = jax.random.normal(
+            next(rngs), (num_blocks, n_v, kq_head_dim, v_head_dim))
+        conv_weight = jax.random.normal(next(rngs), (conv_dim, 1, kernel_size))
+        conv_bias = jax.random.normal(next(rngs), (conv_dim, ))
+        A_log = jax.random.normal(next(rngs), (n_v, ))
+        dt_bias = jax.random.normal(next(rngs), (n_v, ))
+        seq_lens = jnp.array([300 + length for length in spec_lengths],
+                             dtype=jnp.int32)
+
+        run_jitted = jax.jit(
+            wrapper.fused_conv1d_gdn,
+            static_argnames=[
+                "n_kq", "n_v", "d_k", "d_v", "kernel_size", "num_spec_tokens"
+            ],
+        )
+        (new_conv, new_rec), output = run_jitted(
+            mixed_qkv,
+            b,
+            a,
+            conv_state,
+            recurrent_state,
+            conv_weight,
+            conv_bias,
+            A_log,
+            dt_bias,
+            q_loc,
+            jnp.asarray(spec_slots[:, 0], dtype=jnp.int32),
+            distribution,
+            seq_lens,
+            jnp.asarray(read_slots, dtype=jnp.int32),
+            None,
+            jnp.asarray(spec_slots, dtype=jnp.int32),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=kq_head_dim,
+            d_v=v_head_dim,
+            kernel_size=kernel_size,
+            num_spec_tokens=num_spec_tokens,
+        )
+
+        # Contiguous layout: sequence s owns slots 1 + s * window + t and
+        # starts from the state in read_slots[s].
+        bases = np.array([1 + i * window for i in range(num_seqs)])
+        virt_conv = jnp.zeros((1 + num_seqs * window, ) + conv_state.shape[1:])
+        virt_rec = jnp.zeros((1 + num_seqs * window, ) +
+                             recurrent_state.shape[1:])
+        virt_conv = virt_conv.at[bases].set(conv_state[read_slots])
+        virt_rec = virt_rec.at[bases].set(recurrent_state[read_slots])
+        (ref_conv, ref_rec), ref_output = gdn_attention_spec_ref(
+            qkv=mixed_qkv,
+            b=b,
+            a=a,
+            conv_state=virt_conv,
+            recurrent_state=virt_rec,
+            conv_weight=conv_weight,
+            conv_bias=conv_bias,
+            a_log=A_log,
+            dt_bias=dt_bias,
+            query_start_loc=q_loc,
+            state_indices=jnp.asarray(bases, dtype=jnp.int32),
+            read_offsets=jnp.zeros((num_seqs, ), dtype=jnp.int32),
+            num_spec_seqs=num_seqs,
+            seq_lens=seq_lens,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=kq_head_dim,
+            d_v=v_head_dim,
+            kernel_size=kernel_size,
+        )
+        np.testing.assert_allclose(output, ref_output, rtol=2e-2, atol=2e-2)
+
+        expected_conv = np.array(conv_state)
+        expected_rec = np.array(recurrent_state)
+        for s, length in enumerate(spec_lengths):
+            for t in range(length):
+                expected_conv[spec_slots[s, t]] = ref_conv[bases[s] + t]
+                expected_rec[spec_slots[s, t]] = ref_rec[bases[s] + t]
+        np.testing.assert_allclose(new_conv,
+                                   expected_conv,
+                                   rtol=2e-2,
+                                   atol=2e-2)
+        np.testing.assert_allclose(new_rec, expected_rec, rtol=2e-2, atol=2e-2)
+
     def test_has_initial_state_zeros_stale_slot(self):
         """Ensure stale states are ignore by new request.
 

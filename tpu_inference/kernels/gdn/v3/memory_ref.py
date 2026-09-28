@@ -158,6 +158,14 @@ class MetadataRef:
     # a different block (see `cache_config.mamba_cache_mode == "align"`).
     s_idx_to_read_indices: Any
     shape: tuple[int, ...] = dataclasses.field(metadata=dict(static=True))
+    # When True, `s_idx_to_state_indices` is a flattened
+    # [num_seqs, window_size] table and window checkpoint `t` of sequence `s`
+    # is written to slot `s_idx_to_state_indices[s * window_size + t]`
+    # instead of `s_idx_to_state_indices[s] + t`. Mamba prefix caching
+    # ("align" mode) uses it: the verify window's checkpoints go to the
+    # request's block-table columns, which are not consecutive slots.
+    per_position_state_indices: bool = dataclasses.field(
+        default=False, metadata=dict(static=True))
 
     def get_record(self, p_id, idx) -> PackedPIdRecord:
         """View of one p_id's metadata: .r_base / .s_idx / .r_size / .is_*_tile."""
@@ -179,6 +187,7 @@ class MetadataRef:
         s_idx_to_state_indices: jax.Array,
         s_idx_to_read_offset: jax.Array,
         s_idx_to_read_indices: jax.Array,
+        per_position_state_indices: bool = False,
     ):
         # NOTE: First dim does not matter when it comes to calculating stride.
         shape = (1, cfgs.seq_tile_size)
@@ -214,6 +223,7 @@ class MetadataRef:
             s_idx_to_read_offset=s_idx_to_read_offset,
             s_idx_to_read_indices=s_idx_to_read_indices,
             shape=shape,
+            per_position_state_indices=per_position_state_indices,
         )
 
     def __len__(self) -> int:
@@ -421,12 +431,28 @@ class StateBufferedRef(BaseBufferedRef):
             is_last_tile = record.is_last_tile
             s_idx = record.s_idx
             r_size = record.r_size
-            state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
             # Write one checkpoint per valid window position, starting at the
             # group's base slot. `r_size` never exceeds `window_size` for
             # windowed sequences; the clamp is for PER_SEQ tiles, which hold
             # many tokens but keep only the final state.
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
+            if self.metadata_ref.per_position_state_indices:
+                # One single-slot DMA per window position, each to its own
+                # slot. The byte total matches the contiguous case, so
+                # `wait_out` is unchanged.
+                window = self.cfg.window_size
+                for t in range(window):
+                    dma_size = jnp.where(
+                        jnp.logical_and(is_last_tile, t < num_ckpts), 1, 0)
+                    state_idx = self.metadata_ref.s_idx_to_state_indices[
+                        s_idx * window + t]
+                    pltpu.make_async_copy(
+                        vmem_ref.at[idx, pl.ds(t, dma_size)],
+                        dst_ref.at[pl.ds(state_idx, dma_size)],
+                        sem,
+                    ).start()
+                continue
+            state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
             dma_size = jnp.where(is_last_tile, num_ckpts, 0)
 
             pltpu.make_async_copy(

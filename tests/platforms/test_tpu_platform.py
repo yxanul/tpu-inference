@@ -247,7 +247,8 @@ class TestTpuPlatform:
     @pytest.mark.parametrize("is_hybrid,unsupported,expected_prefix_caching", [
         (True, None, True),
         (True, "dp", True),
-        (True, "spec", False),
+        (True, "spec", True),
+        (True, "spec_env_off", False),
         (True, "continue_decode", True),
         (False, None, True),
     ])
@@ -284,13 +285,19 @@ class TestTpuPlatform:
         # output, so the DP size has to come from the patched manager.
         mock_sharding.from_vllm_config.return_value.total_dp_size = (
             2 if unsupported == "dp" else 1)
-        vllm_config.speculative_config = (object()
-                                          if unsupported == "spec" else None)
+        vllm_config.speculative_config = (object() if unsupported
+                                          in ("spec",
+                                              "spec_env_off") else None)
         vllm_config.additional_config = {
             "enable_continue_decode": unsupported == "continue_decode"
         }
 
-        TpuPlatform.check_and_update_config(vllm_config)
+        with patch.dict(
+                os.environ, {
+                    "TPU_DISABLE_HYBRID_SPEC_PREFIX_CACHE":
+                    "1" if unsupported == "spec_env_off" else "0"
+                }):
+            TpuPlatform.check_and_update_config(vllm_config)
 
         assert (vllm_config.cache_config.enable_prefix_caching ==
                 expected_prefix_caching)

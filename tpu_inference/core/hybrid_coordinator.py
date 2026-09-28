@@ -255,8 +255,18 @@ class TPUMambaManager(MambaManager):
             # of a multi-block chunk were never written and must not be
             # indexed.
             written_block_idx = (num_tokens - 1) // self.block_size
+            # With speculative decoding a verify window can complete a block
+            # at any of its positions; the runner then commits that boundary
+            # checkpoint into the block after sampling
+            # (layers/common/mamba_align_spec.py). So in a decode step (at
+            # most the last sampled token is uncomputed) every newly full
+            # block was written: its boundary fell in an earlier verify
+            # window, or at this step's first position.
+            decode_step = (self.num_speculative_blocks > 0
+                           and request.num_computed_tokens
+                           >= request.num_tokens - 1)
             block_mask = [
-                num_cached_blocks + i == written_block_idx
+                decode_step or num_cached_blocks + i == written_block_idx
                 for i in range(num_full_blocks - num_cached_blocks)
             ]
             if retention_mask is not None:

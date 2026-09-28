@@ -91,12 +91,16 @@ class MultiGroupBlockTable:
                  pin_memory: bool,
                  block_sizes: list[int],
                  num_speculative_tokens: int = 0) -> None:
+        # With speculative decoding, align-mode mamba groups hold
+        # `num_speculative_tokens` scratch blocks past the last token's block
+        # (vLLM MambaManager), and non-align mamba groups hold
+        # `1 + num_speculative_tokens` slots.
         self.block_tables = [
             BlockTable(
                 max_num_reqs,
-                max(cdiv(max_model_len, block_size),
-                    1 + num_speculative_tokens), max_num_batched_tokens,
-                pin_memory) for block_size in block_sizes
+                cdiv(max_model_len, block_size) + num_speculative_tokens,
+                max_num_batched_tokens, pin_memory)
+            for block_size in block_sizes
         ]
 
     def append_row(self, block_ids: list[list[int]], row_idx: int) -> None:

@@ -296,6 +296,7 @@ def fused_conv1d_gdn(
     seq_lens: jax.Array,  # [num_seqs]
     read_state_indices: jax.Array,  # [num_seqs]
     read_offsets: jax.Array | None = None,  # [num_seqs]
+    spec_state_indices: jax.Array | None = None,  # [num_seqs, window]
     *,
     n_kq: int,
     n_v: int,
@@ -347,7 +348,15 @@ def fused_conv1d_gdn(
             sequences read their initial state from
             `read_state_indices[s] + read_offsets[s]` and write one checkpoint
             per window position to `state_indices[s] + t`. Required when
-            `num_spec_tokens > 0`.
+            `num_spec_tokens > 0`, unless `spec_state_indices` is given.
+        spec_state_indices: Optional [num_seqs, num_spec_tokens + 1] int32 —
+            per-position checkpoint slots for windowed sequences: window
+            checkpoint `t` of sequence `s` is written to
+            `spec_state_indices[s, t]` instead of `state_indices[s] + t`.
+            Mamba prefix caching ("align" mode) passes the request's
+            block-table columns here (they are not consecutive slots) and
+            resolves rollback outside the kernel, so the initial state is read
+            from `read_state_indices[s]` (offset 0).
         n_kq: Number of key/query heads.
         n_v: Number of value heads.
         d_k: Key/query dimension.
@@ -387,8 +396,16 @@ def fused_conv1d_gdn(
     assert state_indices.shape == (num_seqs, )
     assert distribution.shape == (3, )
     if num_spec_tokens > 0:
-        assert read_offsets is not None, (
-            "read_offsets is required when num_spec_tokens > 0")
+        assert read_offsets is not None or spec_state_indices is not None, (
+            "read_offsets or spec_state_indices is required when "
+            "num_spec_tokens > 0")
+    if spec_state_indices is not None:
+        assert num_spec_tokens > 0, (
+            "spec_state_indices requires num_spec_tokens > 0")
+        assert spec_state_indices.shape == (num_seqs, num_spec_tokens +
+                                            1), (spec_state_indices.shape,
+                                                 num_seqs, num_spec_tokens)
+        spec_state_indices = spec_state_indices.astype(state_indices.dtype)
     if read_offsets is None:
         read_offsets = jnp.zeros((num_seqs, ), dtype=jnp.int32)
     assert read_offsets.shape == (num_seqs, )
@@ -510,6 +527,7 @@ def fused_conv1d_gdn(
                 read_offsets=read_offsets,
                 end_seq=distribution[0],
                 read_indices=read_state_indices,
+                spec_state_indices=spec_state_indices,
             )
         else:
             metadata_obj = metadata.compute_per_seq_metadata(

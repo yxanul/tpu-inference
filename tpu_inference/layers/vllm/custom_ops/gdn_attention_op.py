@@ -121,16 +121,15 @@ def gdn_attention_core_tpu(
     # Speculative decoding: vLLM's MambaSpec widens the conv state by
     # `num_spec` columns, so the number of draft tokens is statically
     # recoverable from the allocated shape. The extra columns themselves are
-    # unused on TPU (rollback keeps one full checkpoint per group slot
-    # instead of a rolling window); only the first kernel_size - 1 columns
-    # per slot hold data.
+    # unused on TPU (rollback keeps one full checkpoint per slot instead of a
+    # rolling window); only the first kernel_size - 1 columns per slot hold
+    # data. `mamba_request_distribution` is set iff spec decoding is on.
     num_spec_tokens = 0
-    if slot_read_offsets is not None:
+    if attn_metadata.mamba_request_distribution is not None:
         num_spec_tokens = state_len - (kernel_size - 1)
         assert num_spec_tokens > 0, (
-            "mamba_slot_read_offsets is set but the conv state has no "
-            f"speculative columns (state_len={state_len}, "
-            f"kernel_size={kernel_size})")
+            "spec decoding is on but the conv state has no speculative "
+            f"columns (state_len={state_len}, kernel_size={kernel_size})")
 
     padded_num_reqs_per_dp = padded_num_reqs // dp_size
 
@@ -140,6 +139,7 @@ def gdn_attention_core_tpu(
                                               dp_size)
 
     cache_config = vllm_context.vllm_config.cache_config
+    spec_state_indices_sliced = None
     if cache_config.mamba_cache_mode == "align":
         # Mamba prefix caching ("align" mode): derive read/write state slots
         # from the mamba block table directly on TPU.
@@ -171,6 +171,22 @@ def gdn_attention_core_tpu(
             block_tables_sliced[batch_idx, read_col], 0, local_rows - 1)
         state_indices_sliced = jnp.clip(
             block_tables_sliced[batch_idx, write_col], 0, local_rows - 1)
+        if num_spec_tokens > 0:
+            # vLLM's align-mode MambaManager gives each request
+            # `num_speculative_blocks` scratch blocks after its running block
+            # (column `write_col`, the block of the window's last token).
+            # Verify-window checkpoint `t` goes to column `write_col + t`, as
+            # on GPU. Rollback happens after sampling
+            # (`commit_align_spec_mamba_states`): the accepted checkpoint is
+            # copied into block `(num_computed - 1) // block_size`, where
+            # the next step reads it with `read_col` above.
+            spec_cols = jnp.minimum(
+                write_col[:, None] +
+                jnp.arange(num_spec_tokens + 1, dtype=write_col.dtype),
+                block_tables_sliced.shape[-1] - 1)
+            spec_state_indices_sliced = jnp.clip(
+                jnp.take_along_axis(block_tables_sliced, spec_cols, axis=1), 0,
+                local_rows - 1)
     else:
         # Index mamba state by the per-request slot id from
         # `InputBatch.mamba_state_indices_cpu`, not by `block_tables[:, 0]`
@@ -190,6 +206,9 @@ def gdn_attention_core_tpu(
                                                        padded_num_reqs_per_dp,
                                                        dp_size)
         read_state_indices_sliced = state_indices_sliced
+        assert num_spec_tokens == 0 or slot_read_offsets is not None, (
+            "spec decoding without prefix caching needs "
+            "mamba_slot_read_offsets")
 
     (new_conv_state_extracted,
      new_recurrent_state), j_output = run_jax_gdn_attention(
@@ -215,6 +234,7 @@ def gdn_attention_core_tpu(
          read_state_indices=read_state_indices_sliced,
          slot_read_offsets=slot_read_offsets,
          num_spec_tokens=num_spec_tokens,
+         spec_state_indices=spec_state_indices_sliced,
      )
     if state_len > kernel_size - 1:
         remaining_old_state = conv_state[:, kernel_size - 1:, :]

@@ -49,6 +49,7 @@ def run_jax_gdn_attention(
     read_state_indices: Optional[jnp.ndarray] = None,
     slot_read_offsets: Optional[jnp.ndarray] = None,
     num_spec_tokens: int = 0,
+    spec_state_indices: Optional[jnp.ndarray] = None,
 ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Runs the Jax GDN attention mechanism.
 
@@ -91,9 +92,13 @@ def run_jax_gdn_attention(
           checkpoints into the block covering its current position.
         slot_read_offsets: Optional `(num_blocks,)` per-slot mamba read offset
           for spec decoding, gathered per request as
-          `slot_read_offsets[state_indices]`. Required iff `num_spec_tokens > 0`.
+          `slot_read_offsets[state_indices]`. With `num_spec_tokens > 0`,
+          required unless `spec_state_indices` is given.
         num_spec_tokens: Number of speculative draft tokens (0 disables the
           spec-decode windowed mode).
+        spec_state_indices: Optional `(max_reqs, num_spec_tokens + 1)` slots
+          that windowed requests write their per-position checkpoints to
+          (mamba prefix caching: the request's block-table columns).
 
     Returns:
         A tuple containing:
@@ -129,6 +134,8 @@ def run_jax_gdn_attention(
     # None with a matching None spec (no sharded array).
     in_specs = in_specs + (P(ShardingAxisName.ATTN_DATA) if slot_read_offsets
                            is not None else None, )  # slot_read_offsets
+    in_specs = in_specs + (P(ShardingAxisName.ATTN_DATA, None)
+                           if spec_state_indices is not None else None, )
 
     out_specs = (
         (
@@ -142,12 +149,11 @@ def run_jax_gdn_attention(
 
     tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
 
-    def p_run_jax_gdn_attention_local(j_mixed_qkv, j_b, j_a, conv_state,
-                                      recurrent_state, j_conv_weight,
-                                      j_conv_bias, j_A_log, j_dt_bias,
-                                      query_start_loc, state_indices,
-                                      distribution, seq_lens,
-                                      read_state_indices, slot_read_offsets):
+    def p_run_jax_gdn_attention_local(
+            j_mixed_qkv, j_b, j_a, conv_state, recurrent_state, j_conv_weight,
+            j_conv_bias, j_A_log, j_dt_bias, query_start_loc, state_indices,
+            distribution, seq_lens, read_state_indices, slot_read_offsets,
+            spec_state_indices):
         read_offsets = None
         if slot_read_offsets is not None:
             # `state_indices` are rank-local base slots; `slot_read_offsets`
@@ -169,6 +175,7 @@ def run_jax_gdn_attention(
             seq_lens,
             read_state_indices,
             read_offsets,
+            spec_state_indices,
             n_kq=n_kq // tp_size,
             n_v=n_v // tp_size,
             d_k=d_k,
@@ -201,6 +208,7 @@ def run_jax_gdn_attention(
         seq_lens,
         read_state_indices,
         slot_read_offsets,
+        spec_state_indices,
     )
 
     (new_conv_state, new_recurrent_state), output = mapped_fn(*mapped_args)
