@@ -322,6 +322,10 @@ class TpuPlatform(Platform):
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
 
         cls._resolve_multiprocess_dp(vllm_config)
+        # validate_request only sees the request; remember what it needs.
+        cls._rejects_prompt_logprobs = ("speculative decoding"
+                                        if vllm_config.speculative_config
+                                        is not None else None)
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             assert not vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING, (
@@ -590,6 +594,13 @@ class TpuPlatform(Platform):
         if isinstance(params, SamplingParams):
             if params.sampling_type == SamplingType.RANDOM_SEED:
                 raise ValueError("JAX does not support per-request seed.")
+            # The runner cannot serve these; rejecting the request here
+            # returns an error to its client instead of raising inside
+            # execute_model, which kills the engine for every request.
+            reason = getattr(cls, "_rejects_prompt_logprobs", None)
+            if params.prompt_logprobs is not None and reason is not None:
+                raise ValueError(
+                    f"prompt_logprobs is not supported with {reason} on TPU.")
 
     @classmethod
     def is_kv_cache_dtype_supported(cls, kv_cache_dtype: str,

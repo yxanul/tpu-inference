@@ -160,8 +160,27 @@ class TestTpuPlatform:
         from vllm.sampling_params import SamplingParams, SamplingType
         params = MagicMock(spec=SamplingParams)
         params.sampling_type = SamplingType.GREEDY
+        params.prompt_logprobs = None
         # Should execute cleanly without raising
         TpuPlatform.validate_request(MagicMock(), params)
+
+    def test_validate_request_prompt_logprobs_with_spec_decode(self):
+        """Rejected up front: the runner raising it would kill the engine."""
+        from vllm.sampling_params import SamplingParams, SamplingType
+        params = MagicMock(spec=SamplingParams)
+        params.sampling_type = SamplingType.GREEDY
+        params.prompt_logprobs = 1
+        with patch.object(TpuPlatform,
+                          "_rejects_prompt_logprobs",
+                          "speculative decoding",
+                          create=True):
+            with pytest.raises(ValueError, match="prompt_logprobs"):
+                TpuPlatform.validate_request(MagicMock(), params)
+        with patch.object(TpuPlatform,
+                          "_rejects_prompt_logprobs",
+                          None,
+                          create=True):
+            TpuPlatform.validate_request(MagicMock(), params)
 
     def test_get_attn_backend_cls_mla(self):
         with patch.dict('sys.modules',
