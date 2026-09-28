@@ -435,7 +435,9 @@ class TpuPlatform(Platform):
             if parallel_config.pipeline_parallel_size == 1:
                 logger.info("Force using UniProcExecutor for JAX on "
                             "single host without pipeline parallelism.")
-                parallel_config.distributed_executor_backend = "uni"
+                from tpu_inference.executors.uniproc_executor import \
+                    UniProcExecutor
+                parallel_config.distributed_executor_backend = UniProcExecutor
             else:
                 logger.info("Force using MultiprocExecutor for JAX on "
                             "single host with pipeline parallelism.")
@@ -461,7 +463,9 @@ class TpuPlatform(Platform):
             logger.warning(
                 f"Unknown TPU multihost backend: {multihost_backend}. "
                 "Using uniproc_executor.")
-            parallel_config.distributed_executor_backend = "uni"
+            from tpu_inference.executors.uniproc_executor import \
+                UniProcExecutor
+            parallel_config.distributed_executor_backend = UniProcExecutor
 
         if scheduler_config.is_multimodal_model and not \
             scheduler_config.disable_chunked_mm_input:
