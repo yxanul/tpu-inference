@@ -70,6 +70,13 @@ def gdn_attention_core_tpu(
     query_start_loc = attn_metadata.query_start_loc
     seq_lens = attn_metadata.seq_lens
     block_tables = attn_metadata.block_tables
+    slot_read_offsets = attn_metadata.mamba_slot_read_offsets
+    if attn_metadata.mamba_request_distribution is not None:
+        # Spec decoding: the GDN windowed segment covers both 1-token
+        # decodes and speculative verify windows (the batch is ordered
+        # [decode][verify][prefill/mixed]); RPA keeps using
+        # `request_distribution` with its 1-token decode front segment.
+        request_distribution = attn_metadata.mamba_request_distribution
 
     layer_module = fc.no_compile_layers[layer_name]
     vllm_context = get_vllm_model_wrapper_context()
@@ -110,6 +117,20 @@ def gdn_attention_core_tpu(
         conv_state_in = conv_state[:, :kernel_size - 1, :]
     else:
         conv_state_in = conv_state
+
+    # Speculative decoding: vLLM's MambaSpec widens the conv state by
+    # `num_spec` columns, so the number of draft tokens is statically
+    # recoverable from the allocated shape. The extra columns themselves are
+    # unused on TPU (rollback keeps one full checkpoint per group slot
+    # instead of a rolling window); only the first kernel_size - 1 columns
+    # per slot hold data.
+    num_spec_tokens = 0
+    if slot_read_offsets is not None:
+        num_spec_tokens = state_len - (kernel_size - 1)
+        assert num_spec_tokens > 0, (
+            "mamba_slot_read_offsets is set but the conv state has no "
+            f"speculative columns (state_len={state_len}, "
+            f"kernel_size={kernel_size})")
 
     padded_num_reqs_per_dp = padded_num_reqs // dp_size
 
@@ -192,6 +213,8 @@ def gdn_attention_core_tpu(
          kernel_size,
          mesh=mesh,
          read_state_indices=read_state_indices_sliced,
+         slot_read_offsets=slot_read_offsets,
+         num_spec_tokens=num_spec_tokens,
      )
     if state_len > kernel_size - 1:
         remaining_old_state = conv_state[:, kernel_size - 1:, :]
