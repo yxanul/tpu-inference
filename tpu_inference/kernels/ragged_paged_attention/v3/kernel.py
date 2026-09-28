@@ -19,6 +19,7 @@ specifications. It supports mixed prefill and decoding, enhancing throughput
 during inference.
 """
 import functools
+import os
 from enum import Enum
 from typing import Any
 
@@ -61,6 +62,11 @@ class RpaCase(Enum):
             return distribution[1], distribution[2]
         else:
             raise ValueError(f"Unsupported RPA case: {self}")
+
+
+# Debug: TPU_KERNEL_BOUNDS_CHECKS=1 turns out-of-bounds DMAs into errors with a
+# location instead of a core halt.
+_DISABLE_CHECKS = os.environ.get("TPU_KERNEL_BOUNDS_CHECKS", "0") != "1"
 
 
 def ref_ragged_paged_attention(
@@ -1622,8 +1628,8 @@ def ragged_paged_attention(
     vmem_limit_bytes: int | None = None,
     # Debug params.
     debug_mode: bool = False,
-    disable_bounds_checks: bool = True,
-    disable_semaphore_checks: bool = True,
+    disable_bounds_checks: bool = _DISABLE_CHECKS,
+    disable_semaphore_checks: bool = _DISABLE_CHECKS,
 ):
     """Ragged paged attention that supports mixed prefill and decode.
 
