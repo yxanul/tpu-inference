@@ -99,24 +99,29 @@ def copy_state_slots(states: tuple[jax.Array, ...], src: jax.Array,
                      dst: jax.Array) -> tuple[jax.Array, ...]:
     """In place, for every array `x` in `states`: `x[dst[p, i]] = x[src[p, i]]`.
 
-    One single-slot HBM-to-HBM DMA per pair and array, so the cost is the
-    number of real copies (pairs with `src == dst` issue empty DMAs). Phases
-    (rows of `src`/`dst`) run in order; pairs within a phase must not read a
-    slot another pair of the same phase writes.
+    One single-slot HBM-to-HBM DMA per real pair and array: pairs with
+    `src == dst` are compacted away before the kernel, so padded rows cost
+    nothing. Phases (rows of `src`/`dst`) run in order; pairs within a phase
+    must not read a slot another pair of the same phase writes.
     """
     num_states = len(states)
     num_phases, num_pairs = src.shape
+    # Move each phase's real pairs to the front; the kernel loops over them.
+    real = src != dst
+    order = jnp.argsort(~real, axis=1, stable=True)
+    src = jnp.take_along_axis(src, order, axis=1)
+    dst = jnp.take_along_axis(dst, order, axis=1)
+    counts = real.sum(axis=1).astype(jnp.int32)
 
-    def kernel(src_ref, dst_ref, *refs):
+    def kernel(src_ref, dst_ref, count_ref, *refs):
         state_refs = refs[num_states:2 * num_states]
         sem = refs[2 * num_states]
 
         def copies(phase, i):
             s = src_ref[phase * num_pairs + i]
             d = dst_ref[phase * num_pairs + i]
-            n = jnp.where(s != d, 1, 0)
             return [
-                pltpu.make_async_copy(ref.at[pl.ds(s, n)], ref.at[pl.ds(d, n)],
+                pltpu.make_async_copy(ref.at[pl.ds(s, 1)], ref.at[pl.ds(d, 1)],
                                       sem) for ref in state_refs
             ]
 
@@ -132,8 +137,8 @@ def copy_state_slots(states: tuple[jax.Array, ...], src: jax.Array,
                     c.wait()
                 return carry
 
-            jax.lax.fori_loop(0, num_pairs, start, 0)
-            jax.lax.fori_loop(0, num_pairs, wait, 0)
+            jax.lax.fori_loop(0, count_ref[phase], start, 0)
+            jax.lax.fori_loop(0, count_ref[phase], wait, 0)
 
     smem_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
@@ -146,14 +151,14 @@ def copy_state_slots(states: tuple[jax.Array, ...], src: jax.Array,
         kernel,
         out_shape=tuple(
             jax.ShapeDtypeStruct(x.shape, x.dtype) for x in states),
-        in_specs=(smem_spec, smem_spec) + (hbm_spec, ) * num_states,
+        in_specs=(smem_spec, smem_spec, smem_spec) + (hbm_spec, ) * num_states,
         out_specs=(hbm_spec, ) * num_states,
         scratch_shapes=(pltpu.SemaphoreType.DMA(()), ),
-        input_output_aliases={2 + i: i
+        input_output_aliases={3 + i: i
                               for i in range(num_states)},
         compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
         name="mamba_copy_state_slots",
-    )(src.reshape(-1), dst.reshape(-1), *states)
+    )(src.reshape(-1), dst.reshape(-1), counts, *states)
 
 
 @functools.partial(jax.jit,
