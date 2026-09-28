@@ -476,7 +476,9 @@ class TpuPlatform(Platform):
             logger.warning(
                 f"Unknown TPU multihost backend: {multihost_backend}. "
                 "Using uniproc_executor.")
-            parallel_config.distributed_executor_backend = "uni"
+            from tpu_inference.executors.uniproc_executor import \
+                UniProcExecutor
+            parallel_config.distributed_executor_backend = UniProcExecutor
 
         if scheduler_config.is_multimodal_model and not \
             scheduler_config.disable_chunked_mm_input:
