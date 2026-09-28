@@ -15,7 +15,6 @@
 Bridge the torch gdn_attention_core op for gated deltanet attention TPU impl
 
 """
-import functools
 from typing import Optional, Tuple
 
 import jax
