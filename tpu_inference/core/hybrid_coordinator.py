@@ -214,6 +214,22 @@ class TPUMambaManager(MambaManager):
             self._checkpoint_positions = {}
         if not hasattr(self, "_pending_boundary_state_offloads"):
             self._pending_boundary_state_offloads = []
+        self._dbg_hashed: dict = {}
+
+    def _relocate_speculative_block(self, req_blocks, block_idx) -> None:
+        block = req_blocks[block_idx]
+        if not self.block_pool.is_block_writable(block):
+            req = next((r for r, b in self.req_to_blocks.items()
+                        if b is req_blocks), None)
+            layout = [(i, b.block_id, b.block_hash is not None, b.ref_cnt)
+                      for i, b in enumerate(req_blocks) if not b.is_null]
+            logger.error(
+                "[spec-relocate] req=%s col=%d block=%d hashed=%s ref=%d "
+                "last_state=%s layout=%s hashed_by=%s", req, block_idx,
+                block.block_id, block.block_hash is not None, block.ref_cnt,
+                self.last_state_block_idx.get(req), layout,
+                self._dbg_hashed.get(block.block_id))
+        super()._relocate_speculative_block(req_blocks, block_idx)
 
     def cache_blocks(
             self,
@@ -289,6 +305,11 @@ class TPUMambaManager(MambaManager):
                 if block.is_null or block.block_hash is None:
                     continue
                 self.cached_blocks_this_step.add(block.block_hash)
+                self._dbg_hashed[block.block_id] = dict(
+                    req=request_id, col=idx, num_tokens=num_tokens,
+                    computed=request.num_computed_tokens,
+                    known=request.num_tokens, decode=decode_step,
+                    n_blocks=len(blocks), cached_from=num_cached_blocks)
                 if block.block_hash_num_tokens is not None:
                     self._pending_boundary_state_offloads.append(
                         (request_id, self.kv_cache_group_id, block,
