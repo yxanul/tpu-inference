@@ -224,60 +224,69 @@ class TPUMambaManager(MambaManager):
             replay_boundaries: Sequence[int] = (),
             **kwargs,
     ) -> None:
-        if num_tokens <= 0:
-            return
-
         if self.mamba_cache_mode != "align":
-            super().cache_blocks(
-                request,
-                num_tokens,
-                retention_interval=retention_interval,
-            )
+            super().cache_blocks(request,
+                                 num_tokens,
+                                 retention_interval=retention_interval,
+                                 replay_boundaries=replay_boundaries)
+            return
+        if num_tokens <= 0 or not self.kv_cache_spec.prefix_cacheable:
             return
 
-        if not self.kv_cache_spec.prefix_cacheable:
-            return
-
-        num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
+        request_id = request.request_id
+        num_cached_blocks = self.num_cached_block.get(request_id, 0)
         num_full_blocks = num_tokens // self.block_size
-
         if num_cached_blocks < num_full_blocks:
-            # The GDN kernel writes exactly one checkpoint per forward pass, at
-            # token `num_tokens - 1`. Only this block holds valid state;
-            # intermediate blocks were never checkpointed.
+            reachable_boundaries = [*replay_boundaries]
+            if request.shared_prefix_boundary:
+                reachable_boundaries.append(request.shared_prefix_boundary)
+            retention_mask = self.reachable_block_mask(
+                start_block=num_cached_blocks,
+                end_block=num_full_blocks,
+                alignment_tokens=self.cache_hit_alignment_tokens,
+                kv_cache_spec=self.kv_cache_spec,
+                use_eagle=self.use_eagle,
+                retention_interval=retention_interval,
+                reachable_boundaries=reachable_boundaries,
+                dcp_world_size=self.dcp_world_size,
+            )
+            # The GDN kernel writes exactly one checkpoint per forward pass,
+            # into block `(num_tokens - 1) // block_size`. Intermediate blocks
+            # of a multi-block chunk were never written and must not be
+            # indexed.
             written_block_idx = (num_tokens - 1) // self.block_size
-            block_mask = [(num_cached_blocks + i) == written_block_idx
-                          for i in range(num_full_blocks - num_cached_blocks)]
-
+            block_mask = [
+                num_cached_blocks + i == written_block_idx
+                for i in range(num_full_blocks - num_cached_blocks)
+            ]
+            if retention_mask is not None:
+                block_mask = [
+                    written and retained
+                    for written, retained in zip(block_mask, retention_mask)
+                ]
             self.block_pool.cache_full_blocks(
                 request=request,
-                blocks=self.req_to_blocks[request.request_id],
+                blocks=self.req_to_blocks[request_id],
                 num_cached_blocks=num_cached_blocks,
                 num_full_blocks=num_full_blocks,
                 block_size=self.block_size,
                 kv_cache_group_id=self.kv_cache_group_id,
                 block_mask=block_mask,
             )
-
-            blocks = self.req_to_blocks[request.request_id]
+            blocks = self.req_to_blocks[request_id]
             for idx in range(num_cached_blocks, num_full_blocks):
                 block = blocks[idx]
                 if block.is_null or block.block_hash is None:
                     continue
                 self.cached_blocks_this_step.add(block.block_hash)
                 if block.block_hash_num_tokens is not None:
-                    self._pending_boundary_state_offloads.append((
-                        request.request_id,
-                        self.kv_cache_group_id,
-                        block,
-                        block.block_hash_num_tokens,
-                    ))
+                    self._pending_boundary_state_offloads.append(
+                        (request_id, self.kv_cache_group_id, block,
+                         block.block_hash_num_tokens))
+            self.num_cached_block[request_id] = num_full_blocks
 
-            self.num_cached_block[request.request_id] = num_full_blocks
-
-        if not hasattr(self, "_checkpoint_positions"):
-            self._checkpoint_positions = {}
-        partial_hash = self._cache_partial_tail_block(request, num_tokens)
+        partial_hash = self._cache_partial_tail_block(
+            request, num_tokens, retention_interval=retention_interval)
         if partial_hash is not None:
             self.cached_blocks_this_step.add(partial_hash)
 
