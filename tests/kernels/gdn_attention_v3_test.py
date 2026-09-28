@@ -995,3 +995,73 @@ class GDNAttentionTest(parameterized.TestCase):
         self.assertTrue(
             np.any(np.asarray(rec_after_b[write_slot]) != 0.0),
             "write_slot should hold the step's final recurrent state")
+
+    @parameterized.named_parameters(
+        dict(testcase_name="decode_10", num_seqs=10),
+        dict(testcase_name="decode_16", num_seqs=16),
+    )
+    def test_batched_decode_inside_outer_jit(self, num_seqs):
+        """Batched decode spanning >2 tiles, called from inside another jit.
+
+        This is how the model step invokes the kernel: the recurrent/conv state
+        is aliased input->output but not donated at this level, so XLA owns the
+        operand placement. On TPU v4 its memory-space assignment could put
+        those operands in CMEM, which the kernel's HBM DMAs cannot address:
+        the core halted (RuntimeUnexpectedCoreHalt) for >= 10 sequences at the
+        default decode tile size. Operands are now pinned to HBM on v4.
+        """
+        max_reqs, num_blocks = 16, 33
+        n_kq, n_v, d_k, d_v, kernel_size = 4, 12, 128, 128, 4
+        dim = 2 * n_kq * d_k + n_v * d_v
+        rngs = iter(jax.random.split(jax.random.key(0), 10))
+
+        q_loc = np.zeros(max_reqs + 1, np.int32)
+        q_loc[1:num_seqs + 1] = np.arange(1, num_seqs + 1)
+        q_loc[num_seqs + 1:] = num_seqs
+        state_indices = np.zeros(max_reqs, np.int32)
+        state_indices[:num_seqs] = np.arange(1, num_seqs + 1)
+        seq_lens = np.zeros(max_reqs, np.int32)
+        seq_lens[:num_seqs] = 100  # decodes with prior context
+
+        conv_state = jax.random.normal(next(rngs),
+                                       (num_blocks, kernel_size - 1, dim))
+        recurrent_state = jax.random.normal(next(rngs),
+                                            (num_blocks, n_v, d_k, d_v))
+        common_kwargs = dict(
+            qkv=jax.random.normal(next(rngs), (max_reqs, dim)),
+            b=jax.random.normal(next(rngs), (max_reqs, n_v)),
+            a=jax.random.normal(next(rngs), (max_reqs, n_v)),
+            conv_state=0.1 * conv_state,
+            recurrent_state=0.01 * recurrent_state,
+            conv_weight=jax.random.normal(next(rngs), (dim, 1, kernel_size)),
+            conv_bias=None,
+            a_log=jax.random.normal(next(rngs), (n_v, )),
+            dt_bias=jax.random.normal(next(rngs), (n_v, )),
+            query_start_loc=jnp.asarray(q_loc),
+            state_indices=jnp.asarray(state_indices),
+            distribution=jnp.array([num_seqs, num_seqs, num_seqs],
+                                   dtype=jnp.int32),
+            seq_lens=jnp.asarray(seq_lens),
+            read_state_indices=jnp.asarray(state_indices),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+        new_states_ref, output_ref = gdn_attention_ref(**common_kwargs)
+
+        static = ("n_kq", "n_v", "d_k", "d_v", "kernel_size")
+        outer = jax.jit(lambda **kw: wrapper.fused_conv1d_gdn(**kw),
+                        static_argnames=static)
+        new_states, output = outer(**common_kwargs)
+
+        np.testing.assert_allclose(output[:num_seqs],
+                                   output_ref[:num_seqs],
+                                   rtol=2e-2,
+                                   atol=2e-2)
+        live = np.asarray(state_indices[:num_seqs])
+        np.testing.assert_allclose(np.asarray(new_states[1])[live],
+                                   np.asarray(new_states_ref[1])[live],
+                                   rtol=2e-2,
+                                   atol=2e-2)
