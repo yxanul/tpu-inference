@@ -561,6 +561,16 @@ class TPUHybridOffloadingConnector(OffloadingConnector):
             _GROUP_INFO.update(
                 group_info_from_kv_cache_config(kv_cache_config))
         super().__init__(vllm_config, role, kv_cache_config)
+        if self.connector_scheduler is not None:
+            # vLLM expects one completion report per rank (world_size); TPU
+            # runs all chips of a host in one worker process, which reports
+            # once. Partial-tail hits need CoW block copies the TPU runner
+            # does not perform.
+            extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+            self.connector_scheduler.config = (
+                self.connector_scheduler.config._replace(
+                    num_workers=int(extra.get("num_worker_processes", 1)),
+                    supports_partial_tail=False))
         worker = self.connector_worker
         if worker is not None:
             self.connector_worker = TPUOffloadingConnectorWorker(
