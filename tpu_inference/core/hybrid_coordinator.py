@@ -162,9 +162,44 @@ class MambaBlockPool(BlockPool):
         return [self.primary_group_id] * len(kv_cache_group_ids)
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
-        blocks = super().get_new_blocks(num_blocks)
+        blocks = (self._get_uncached_first(num_blocks) if self.enable_caching
+                  else super().get_new_blocks(num_blocks))
         self._last_allocation = list(blocks)
         return blocks
+
+    def _get_uncached_first(self, num_blocks: int) -> list[KVCacheBlock]:
+        """Allocate free blocks that hold no cached state before evicting any.
+
+        The base pool pops the head of one free queue, evicting the oldest
+        cached prefix state even while uncached free blocks (running blocks
+        of finished requests, chunk blocks of a prefill) sit behind it. Mamba
+        pools are small (a few hundred states of ~0.1 GiB), so every chunk of
+        a long prefill would evict another session's resume point. Cached
+        states are still evicted oldest-first once no uncached block is left.
+        """
+        if num_blocks > self.get_num_free_blocks():
+            raise ValueError(
+                f"Cannot get {num_blocks} free blocks from the pool")
+        queue = self.free_block_queue
+        chosen: list[KVCacheBlock] = []
+        node = queue.fake_free_list_head.next_free_block
+        while node is not queue.fake_free_list_tail and len(
+                chosen) < num_blocks:
+            next_node = node.next_free_block
+            if node.block_hash is None:
+                chosen.append(node)
+            node = next_node
+        for block in chosen:
+            queue.remove(block)
+            if self._reuse_watchers:
+                self._notify_reuse([block])
+            assert block.ref_cnt == 0
+            block.ref_cnt += 1
+            if self.metrics_collector:
+                self.metrics_collector.on_block_allocated(block)
+        if len(chosen) < num_blocks:
+            chosen += super().get_new_blocks(num_blocks - len(chosen))
+        return chosen
 
     def is_block_writable(self, block: KVCacheBlock) -> bool:
         # A block owned by one request carries one reference per mirrored

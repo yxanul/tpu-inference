@@ -258,6 +258,38 @@ class TestMirrorMambaBlockPool:
         assert {b.block_id for b in hit} == {blocks[0].block_id}
         assert len(primary.cached_block_hash_to_block) == 1
 
+    def test_allocation_prefers_uncached_free_blocks(self):
+        """A freed cached prefix state stays cached while uncached free
+        blocks exist; only then is the oldest cached state evicted."""
+        pool = MambaBlockPool(num_gpu_blocks=6,
+                              enable_caching=True,
+                              hash_block_size=16)
+        req = Request(request_id="r0",
+                      prompt_token_ids=list(range(32)),
+                      sampling_params=MagicMock(),
+                      pooling_params=None)
+        req.block_hashes = [BlockHash(b"h0"), BlockHash(b"h1")]
+        cached = pool.get_new_blocks(2)
+        pool.cache_full_blocks(request=req,
+                               blocks=cached,
+                               num_cached_blocks=0,
+                               num_full_blocks=2,
+                               block_size=16,
+                               kv_cache_group_id=0)
+        # Freed cached blocks sit at the head of the free queue.
+        pool.free_blocks(cached)
+
+        first = pool.get_new_blocks(3)
+        assert not {b.block_id for b in first} & {b.block_id for b in cached}
+        assert all(b.block_hash is not None for b in cached)
+        assert pool.get_cached_block(BlockHash(b"h0"), [0]) is not None
+
+        # No uncached block left: now the oldest cached state is evicted.
+        second = pool.get_new_blocks(1)
+        assert second[0].block_id == cached[0].block_id
+        assert pool.get_cached_block(BlockHash(b"h0"), [0]) is None
+        assert pool.get_cached_block(BlockHash(b"h1"), [0]) is not None
+
     def test_mirror_does_not_double_cache(self):
         primary, mirror = self._pools()
         req = Request(request_id="r0",
