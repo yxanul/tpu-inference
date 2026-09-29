@@ -137,3 +137,36 @@ def test_worker_store_then_load_round_trip():
     # Untouched blocks keep their contents.
     np.testing.assert_array_equal(np.asarray(kv[0][5]), original[0][5])
     worker.shutdown()
+
+
+def test_worker_splits_jobs_into_bounded_copies():
+    """A 5-block job moves in copies of <= 2 blocks, one in flight."""
+    runner = types.SimpleNamespace(
+        kv_caches=[jnp.arange(10 * 4, dtype=jnp.float32).reshape(10, 4)],
+        layer_name_to_kvcache_index={"a0": 0},
+    )
+    original = np.asarray(runner.kv_caches[0])
+    worker = TPUHybridOffloadingWorker(runner, [["a0"]],
+                                       group_pools=[0],
+                                       pool_sizes=[8],
+                                       max_blocks=2,
+                                       max_inflight=1)
+    src = [1, 2, 3, 4, 5]
+    entries = [(0, i) for i in range(5)]
+    worker.submit_store(
+        1, GPULoadStoreSpec(src, group_sizes=[5], block_indices=[0]),
+        TPUHostLoadStoreSpec(entries))
+    assert sum(len(j.inflight) for j in worker._jobs.values()) <= 1
+    worker.wait({1})
+    assert [r.success for r in worker.get_finished()] == [True]
+
+    runner.kv_caches[0] = jnp.zeros_like(runner.kv_caches[0])
+    worker.submit_load(
+        2, TPUHostLoadStoreSpec(entries),
+        GPULoadStoreSpec(src, group_sizes=[5], block_indices=[0]))
+    worker.wait({2})
+    assert [r.success for r in worker.get_finished()] == [True]
+    restored = np.asarray(runner.kv_caches[0])
+    np.testing.assert_array_equal(restored[1:6], original[1:6])
+    np.testing.assert_array_equal(restored[6:], 0)
+    worker.shutdown()

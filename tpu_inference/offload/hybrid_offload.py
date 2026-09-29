@@ -42,10 +42,10 @@ Enable with::
       "offload_prompt_only": false}}'
 """
 
+import collections
 import concurrent.futures
 import dataclasses
 import functools
-import threading
 import time
 from collections.abc import Collection, Iterable
 from typing import Any
@@ -314,9 +314,13 @@ class TPUHybridOffloadingSpec(OffloadingSpec):
         if self._worker is None:
             group_layers = [list(g.layer_names) for g in self.config.groups]
             group_pools = [self.group_to_pool[g] for g in self.group_ids]
-            self._worker = TPUHybridOffloadingWorker(kv_caches, group_layers,
-                                                     group_pools,
-                                                     self.pool_sizes)
+            self._worker = TPUHybridOffloadingWorker(
+                kv_caches,
+                group_layers,
+                group_pools,
+                self.pool_sizes,
+                max_blocks=int(self.extra_config.get("blocks_per_copy", 16)),
+                max_inflight=int(self.extra_config.get("copies_in_flight", 4)))
         return self._worker
 
 
@@ -336,13 +340,50 @@ def _scatter_blocks(arrays: tuple[jax.Array, ...], block_ids: jax.Array,
     return tuple(a.at[block_ids].set(v) for a, v in zip(arrays, values))
 
 
-class TPUHybridOffloadingWorker(OffloadingWorker):
-    """Moves whole device blocks of one KV-cache group at a time between
-    `runner.kv_caches` and per-pool host arrays."""
+@dataclasses.dataclass
+class _Copy:
+    """One bounded copy: up to `max_blocks` blocks of one KV-cache group."""
+    group: int
+    block_ids: np.ndarray  # padded to a power of two with block 0
+    num_blocks: int
+    pool: int
+    slots: list[int]
 
-    def __init__(self, runner, group_layers: list[list[str]],
-                 group_pools: list[int], pool_sizes: list[int]):
+
+@dataclasses.dataclass
+class _Job:
+    is_load: bool
+    pending: collections.deque
+    start: float
+    inflight: list = dataclasses.field(default_factory=list)
+    nbytes: int = 0
+    failed: bool = False
+
+
+class TPUHybridOffloadingWorker(OffloadingWorker):
+    """Moves whole device blocks between `runner.kv_caches` and per-pool
+    host arrays, in copies of at most `max_blocks` blocks with at most
+    `max_inflight` copies alive at once: each in-flight copy holds its blocks
+    in HBM (gathered for a store, uploaded for a load), and there is little
+    HBM to spare next to the KV pools.
+
+    All device-array work (gathers, scatters into `runner.kv_caches`) runs on
+    the runner thread in `_pump`, called from every connector entry point;
+    background threads only do host copies and host->device uploads. vLLM
+    fences a store's source blocks until the job completes, so gathering them
+    over later steps reads the same data.
+    """
+
+    def __init__(self,
+                 runner,
+                 group_layers: list[list[str]],
+                 group_pools: list[int],
+                 pool_sizes: list[int],
+                 max_blocks: int = 16,
+                 max_inflight: int = 4):
         self._runner = runner
+        self._max_blocks = max_blocks
+        self._max_inflight = max_inflight
         # Per offloaded group: kv_caches positions of its components, as
         # (cache index, element index or None for a plain array).
         self._group_components: list[list[tuple[int, int | None]]] = []
@@ -359,11 +400,9 @@ class TPUHybridOffloadingWorker(OffloadingWorker):
                 else:
                     components.append((idx, None))
             self._group_components.append(components)
-        self._group_pools = group_pools
-        # Host storage: per pool, per component position, one lazily
-        # committed array [num_slots, *block_shape].
+        # Host storage: per pool, per component position, one array
+        # [num_slots, *block_shape]; pages are committed as slots fill up.
         self._pools: list[list[np.ndarray] | None] = [None] * len(pool_sizes)
-        self._pool_sizes = pool_sizes
         for gi, pool in enumerate(group_pools):
             if self._pools[pool] is None:
                 self._pools[pool] = [
@@ -372,10 +411,8 @@ class TPUHybridOffloadingWorker(OffloadingWorker):
                 ]
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="tpu-hybrid-offload")
-        self._lock = threading.Lock()
-        # job_id -> (future, start time, bytes, pending scatter or None)
-        self._jobs: dict[int, tuple[concurrent.futures.Future, float, int,
-                                    Any]] = {}
+        self._jobs: dict[int, _Job] = {}
+        self._results: list[TransferResult] = []
 
     def _arrays(self, gi: int) -> list[jax.Array]:
         caches = self._runner.kv_caches
@@ -394,106 +431,116 @@ class TPUHybridOffloadingWorker(OffloadingWorker):
                 parts[j] = array
                 caches[i] = type(caches[i])(parts)
 
-    @staticmethod
-    def _groups(spec: GPULoadStoreSpec):
+    def _copies(self, device_spec: GPULoadStoreSpec,
+                host_spec: TPUHostLoadStoreSpec) -> collections.deque:
+        copies = collections.deque()
         offset = 0
-        for gi, n in enumerate(spec.group_sizes):
-            if n:
-                yield gi, offset, n
+        for gi, n in enumerate(device_spec.group_sizes):
+            for start in range(offset, offset + n, self._max_blocks):
+                count = min(self._max_blocks, offset + n - start)
+                ids = np.zeros(_bucket(count), dtype=np.int32)
+                ids[:count] = device_spec.block_ids[start:start + count]
+                entries = host_spec.entries[start:start + count]
+                copies.append(
+                    _Copy(gi, ids, count, entries[0][0],
+                          [slot for _, slot in entries]))
             offset += n
+        return copies
 
     def submit_store(self, job_id: int, src_spec: GPULoadStoreSpec,
                      dst_spec: LoadStoreSpec) -> bool:
         assert isinstance(dst_spec, TPUHostLoadStoreSpec)
-        tasks = []
-        for gi, offset, n in self._groups(src_spec):
-            ids = np.zeros(_bucket(n), dtype=np.int32)
-            ids[:n] = src_spec.block_ids[offset:offset + n]
-            # Dispatched now, before later steps overwrite these blocks.
-            gathered = _gather_blocks(tuple(self._arrays(gi)),
-                                      jnp.asarray(ids))
-            slots = [c for _, c in dst_spec.entries[offset:offset + n]]
-            pool = dst_spec.entries[offset][0]
-            tasks.append((pool, slots, n, gathered))
-
-        def copy_out():
-            nbytes = 0
-            for pool, slots, n, gathered in tasks:
-                for host, block in zip(self._pools[pool], gathered):
-                    values = np.asarray(block)[:n]
-                    host[slots] = values
-                    nbytes += values.nbytes
-            return nbytes
-
-        with self._lock:
-            self._jobs[job_id] = (self._executor.submit(copy_out),
-                                  time.perf_counter(), 0, None)
+        self._jobs[job_id] = _Job(False, self._copies(src_spec, dst_spec),
+                                  time.perf_counter())
+        self._pump()
         return True
 
     def submit_load(self, job_id: int, src_spec: LoadStoreSpec,
                     dst_spec: GPULoadStoreSpec) -> bool:
         assert isinstance(src_spec, TPUHostLoadStoreSpec)
-        plan = []
-        for gi, offset, n in self._groups(dst_spec):
-            ids = np.zeros(_bucket(n), dtype=np.int32)
-            ids[:n] = dst_spec.block_ids[offset:offset + n]
-            pool = src_spec.entries[offset][0]
-            slots = [c for _, c in src_spec.entries[offset:offset + n]]
-            plan.append((gi, ids, pool, slots, n))
-        shardings = {
-            gi: [a.sharding for a in self._arrays(gi)]
-            for gi, *_ in plan
-        }
-
-        def copy_in():
-            loaded = []
-            for gi, ids, pool, slots, n in plan:
-                values = []
-                for host, sharding in zip(self._pools[pool], shardings[gi]):
-                    rows = np.zeros((len(ids), ) + host.shape[1:],
-                                    dtype=host.dtype)
-                    rows[:n] = host[slots]
-                    values.append(jax.device_put(rows, sharding))
-                loaded.append((gi, ids, tuple(values)))
-            return loaded
-
-        with self._lock:
-            self._jobs[job_id] = (self._executor.submit(copy_in),
-                                  time.perf_counter(), 0, "load")
+        self._jobs[job_id] = _Job(True, self._copies(dst_spec, src_spec),
+                                  time.perf_counter())
+        self._pump()
         return True
 
-    def _finish(self, job_id: int) -> TransferResult:
-        future, start, _, kind = self._jobs.pop(job_id)
-        try:
-            result = future.result()
-            if kind == "load":
-                # On the runner thread, ahead of the next forward pass.
-                nbytes = 0
-                for gi, ids, values in result:
-                    self._set_arrays(
-                        gi,
-                        _scatter_blocks(tuple(self._arrays(gi)),
-                                        jnp.asarray(ids), values))
-                    nbytes += sum(v.nbytes for v in values)
-            else:
-                nbytes = result
-            return TransferResult(job_id, True, nbytes,
-                                  time.perf_counter() - start)
-        except Exception:
-            logger.exception("[hybrid-offload] transfer job %d failed", job_id)
-            return TransferResult(job_id, False)
+    def _copy_out(self, copy: _Copy, gathered: tuple[jax.Array, ...]) -> int:
+        nbytes = 0
+        for host, block in zip(self._pools[copy.pool], gathered):
+            values = np.asarray(block)[:copy.num_blocks]
+            host[copy.slots] = values
+            nbytes += values.nbytes
+        return nbytes
+
+    def _copy_in(self, copy: _Copy, shardings: list) -> tuple:
+        values = []
+        for host, sharding in zip(self._pools[copy.pool], shardings):
+            rows = np.zeros((len(copy.block_ids), ) + host.shape[1:],
+                            dtype=host.dtype)
+            rows[:copy.num_blocks] = host[copy.slots]
+            values.append(jax.device_put(rows, sharding))
+        return tuple(values)
+
+    def _pump(self) -> None:
+        """Retire finished copies (applying loads) and start new ones."""
+        for job_id, job in list(self._jobs.items()):
+            still = []
+            for copy, future in job.inflight:
+                if not future.done():
+                    still.append((copy, future))
+                    continue
+                try:
+                    if job.is_load:
+                        values = future.result()
+                        self._set_arrays(
+                            copy.group,
+                            _scatter_blocks(tuple(self._arrays(copy.group)),
+                                            jnp.asarray(copy.block_ids),
+                                            values))
+                        job.nbytes += sum(v.nbytes for v in values)
+                    else:
+                        job.nbytes += future.result()
+                except Exception:
+                    logger.exception("[hybrid-offload] job %d copy failed",
+                                     job_id)
+                    job.failed = True
+            job.inflight = still
+        inflight = sum(len(job.inflight) for job in self._jobs.values())
+        for job in self._jobs.values():
+            while job.pending and inflight < self._max_inflight:
+                copy = job.pending.popleft()
+                if job.is_load:
+                    shardings = [a.sharding for a in self._arrays(copy.group)]
+                    future = self._executor.submit(self._copy_in, copy,
+                                                   shardings)
+                else:
+                    gathered = _gather_blocks(tuple(self._arrays(copy.group)),
+                                              jnp.asarray(copy.block_ids))
+                    future = self._executor.submit(self._copy_out, copy,
+                                                   gathered)
+                job.inflight.append((copy, future))
+                inflight += 1
+        for job_id, job in list(self._jobs.items()):
+            if not job.pending and not job.inflight:
+                del self._jobs[job_id]
+                self._results.append(
+                    TransferResult(job_id, not job.failed, job.nbytes,
+                                   time.perf_counter() - job.start))
 
     def get_finished(self) -> list[TransferResult]:
-        with self._lock:
-            done = [j for j, job in self._jobs.items() if job[0].done()]
-        return [self._finish(j) for j in done]
+        self._pump()
+        results, self._results = self._results, []
+        return results
 
     def wait(self, job_ids: set[int]) -> None:
-        for job_id in job_ids:
-            with self._lock:
-                job = self._jobs.get(job_id)
-            if job is not None:
-                job[0].result()
+        while any(j in self._jobs for j in job_ids):
+            self._pump()
+            futures = [
+                f for j in job_ids if j in self._jobs
+                for _, f in self._jobs[j].inflight
+            ]
+            if futures:
+                concurrent.futures.wait(
+                    futures, return_when=concurrent.futures.FIRST_COMPLETED)
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=True)
