@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, Optional
 
 import jax.numpy as jnp
@@ -288,6 +289,11 @@ class SpeculativeDecodingManager:
             aux_hidden_states_for_drafter = (hidden_states, )
         else:
             aux_hidden_states_for_drafter = aux_hidden_states
+        drafter_distribution = getattr(self.runner,
+                                       "_drafter_request_distribution", None)
+        if drafter_distribution is not None:
+            attn_metadata = replace(attn_metadata,
+                                    request_distribution=drafter_distribution)
 
         target_hidden_states, input_ids, last_token_indices, attn_metadata = self.runner.drafter.prepare_inputs(
             attn_metadata,

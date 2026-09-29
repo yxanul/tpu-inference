@@ -14,6 +14,7 @@
 
 import functools
 import logging
+import os
 import random
 import sys
 from contextlib import nullcontext
@@ -51,6 +52,8 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 import tpu_inference.envs as envs
 from tpu_inference import utils as common_utils
 from tpu_inference.core.sched.utils import DEFAULT_MAX_DECODE_STEPS
+from tpu_inference.layers.common.attention_interface import (
+    get_rpa_static_q_len, set_rpa_static_q_len)
 from tpu_inference.layers.common.attention_metadata import (
     AttentionMetadata, GroupedAttentionMetadata, SharedAttentionMetadata)
 from tpu_inference.layers.common.mamba_align_spec import \
@@ -885,6 +888,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # committed after sampling (align mode + spec decoding).
         self._align_spec_mamba_groups: tuple[tuple[int, tuple[int, ...]],
                                              ...] = ()
+        # Full speculative verify windows run in RPA's fixed-query-length
+        # segment (see attention_interface.set_rpa_static_q_len).
+        self._drafter_request_distribution: Optional[jax.Array] = None
+        set_rpa_static_q_len(None)
+        if (self.speculative_config is not None
+                and not envs.USE_BATCHED_RPA_KERNEL
+                and os.environ.get("TPU_RPA_SPEC_WINDOW_SEGMENT", "1") == "1"):
+            set_rpa_static_q_len(
+                self.speculative_config.num_speculative_tokens + 1)
         self.enable_continue_decode = self.vllm_config.additional_config.get(
             "enable_continue_decode", False)
         # continue_decode EOS-check interval: how often the fused decode loop
@@ -3073,6 +3085,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         _request_distribution = []
         _mamba_request_distribution = []
+        rpa_static_q_len = get_rpa_static_q_len()
         for dp_rank in range(dp_size):
             _num_reqs = num_req_per_dp_rank[dp_rank]
             # The batch has been reordered by _reorder_batch into
@@ -3082,17 +3095,31 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # segment) in this DP rank.
             num_decode_in_dp_rank = 0
             num_windowed_in_dp_rank = 0
+            num_full_windows_in_dp_rank = 0
             for req_id in req_ids_dp[dp_rank]:
-                if scheduler_output.num_scheduled_tokens[
-                        req_id] <= max_decode_tokens:
+                num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                if num_tokens <= max_decode_tokens:
                     num_decode_in_dp_rank += 1
                     num_windowed_in_dp_rank += 1
                 elif req_id in scheduler_output.scheduled_spec_decode_tokens:
                     num_windowed_in_dp_rank += 1
-            _request_distribution.append(
-                [num_decode_in_dp_rank, num_decode_in_dp_rank, _num_reqs])
+                    if num_tokens == rpa_static_q_len:
+                        num_full_windows_in_dp_rank += 1
+            # With a static RPA query length, full verify windows (ordered
+            # right after the decodes) form RPA's fixed-length segment.
+            _request_distribution.append([
+                num_decode_in_dp_rank,
+                num_decode_in_dp_rank + num_full_windows_in_dp_rank, _num_reqs
+            ])
             _mamba_request_distribution.append(
                 [num_windowed_in_dp_rank, num_windowed_in_dp_rank, _num_reqs])
+        # The drafter's passes have other query lengths (rejected tokens
+        # trimmed, then one token per request): no fixed-length segment.
+        drafter_request_distribution_cpu = None
+        if rpa_static_q_len is not None:
+            drafter_request_distribution_cpu = np.array(
+                [[d[0], d[0], d[2]] for d in _request_distribution],
+                dtype=np.int32).ravel()
         request_distribution = np.array(_request_distribution,
                                         dtype=np.int32).ravel()
         use_mamba_spec_decode = (self.kv_cache_config.has_mamba_layers
@@ -3273,6 +3300,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 self.mesh, (request_distribution, metadata_blob),
                 sharding=metadata_attn_sharding)
 
+        self._drafter_request_distribution = None
+        if drafter_request_distribution_cpu is not None:
+            self._drafter_request_distribution = device_array(
+                self.mesh,
+                drafter_request_distribution_cpu,
+                sharding=metadata_attn_sharding)
         metadata = common_utils.DeviceBuffer.unpack_arrays(
             dev_arrays_payload, metadata_layout)
         input_ids = metadata["input_ids"]

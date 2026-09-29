@@ -55,6 +55,10 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         k_scale: float | None = None,
         v_scale: float | None = None,
         use_causal_mask: bool = True,
+        distribution: tuple[int, int, int] | None = None,
+        chunk_prefill_size: int | None = None,
+        d_block_sizes: tuple[int, int, int, int] | None = None,
+        p_block_sizes: tuple[int, int, int, int] | None = None,
     ):
         rng = np.random.default_rng(1234)
 
@@ -149,7 +153,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                             (0, max_num_seq + 1 - cu_q_lens.shape[0]))
         kv_lens = jnp.array(kv_lens, dtype=jnp.int32)
         kv_lens = jnp.pad(kv_lens, (0, max_num_seq - kv_lens.shape[0]))
-        distribution = jnp.array([0, 0, len(seq_lens)], dtype=jnp.int32)
+        distribution = jnp.array(distribution or [0, 0, len(seq_lens)],
+                                 dtype=jnp.int32)
 
         args = (
             q,
@@ -180,6 +185,9 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             *args,
             **kwargs,
             m_block_sizes=(bq_sz, bkv_sz, bq_csz, bkv_csz),
+            d_block_sizes=d_block_sizes,
+            p_block_sizes=p_block_sizes,
+            chunk_prefill_size=chunk_prefill_size,
             vmem_limit_bytes=vmem_limit_bytes,
         )
         output = output[:cu_q_lens[distribution[-1]]]
@@ -358,6 +366,37 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             dtype,
             dtype,
             num_pages,
+        )
+
+    @parameterized.product(dtype=[jnp.float32, jnp.bfloat16], )
+    def test_ragged_paged_attention_static_q_segment(self, dtype):
+        """Speculative decoding layout: decodes, then full verify windows in
+        the fixed-query-length segment (chunk_prefill_size = window), then
+        shorter windows and prefills in the mixed segment."""
+        seq_lens = [
+            (1, 300),
+            (1, 1229),
+            (4, 1107),
+            (4, 18),
+            (4, 597),
+            (4, 1328),
+            (2, 463),
+            (3, 64),
+            (120, 229),
+            (40, 181),
+        ]
+        self._test_ragged_paged_attention(
+            seq_lens,
+            (32, 8),
+            128,
+            16,
+            dtype,
+            dtype,
+            1000,
+            distribution=(2, 6, len(seq_lens)),
+            chunk_prefill_size=4,
+            d_block_sizes=(1, 256, 1, 128),
+            p_block_sizes=(4, 256, 4, 128),
         )
 
     @parameterized.product(dtype=[jnp.float32, jnp.bfloat16], )

@@ -403,6 +403,24 @@ def sharded_splash_attention(
         ))
 
 
+# Static query length of RPA's middle ("prefill") segment. With speculative
+# decoding the runner sets it to num_speculative_tokens + 1 and orders full
+# verify windows right after the decodes, so they run with a query tile of
+# the window size instead of the mixed kernel's prefill-sized one (which
+# wastes ~bq_sz / window of the attention work, several ms per step per
+# long-context request). None keeps the segment empty.
+_RPA_STATIC_Q_LEN: int | None = None
+
+
+def set_rpa_static_q_len(q_len: int | None) -> None:
+    global _RPA_STATIC_Q_LEN
+    _RPA_STATIC_Q_LEN = q_len
+
+
+def get_rpa_static_q_len() -> int | None:
+    return _RPA_STATIC_Q_LEN
+
+
 def rpa_block_size_kwargs() -> dict[str, tuple[int, int, int, int]]:
     """Optional RPA v3 block-size overrides from env, for the call site to
     forward with ``**``.
@@ -517,6 +535,8 @@ def sharded_ragged_paged_attention(
                 # RPA_V3_*_BLOCK_SIZES are v3-kernel knobs; the experimental
                 # batched kernel takes its own BlockSizes configs instead.
                 kwargs.update(rpa_block_size_kwargs())
+                if _RPA_STATIC_Q_LEN is not None:
+                    kwargs["chunk_prefill_size"] = _RPA_STATIC_Q_LEN
         return func(*args, **kwargs)
 
     return jax.shard_map(

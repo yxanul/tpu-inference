@@ -80,16 +80,19 @@ class PersistentBatchManager:
             return swap_cnt
 
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        full_window = self.input_batch.num_speculative_tokens + 1
 
         def segment(req_id: str) -> int:
-            # 0: decode (<= max_decode_tokens), 1: speculative verify window,
-            # 2: prefill/mixed.
-            if scheduler_output.num_scheduled_tokens[
-                    req_id] <= max_decode_tokens:
+            # 0: decode (<= max_decode_tokens), 1: full speculative verify
+            # window (num_speculative_tokens + 1 tokens: RPA runs these with
+            # a static query length), 2: shorter verify window, 3:
+            # prefill/mixed.
+            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            if num_tokens <= max_decode_tokens:
                 return 0
             if req_id in spec_decode_tokens:
-                return 1
-            return 2
+                return 1 if num_tokens == full_window else 2
+            return 3
 
         def partition(start: int, end: int, bound: int) -> int:
             """Two-pointer partition of [start, end]: requests with
@@ -113,10 +116,14 @@ class PersistentBatchManager:
 
         # Pass 1: decode requests to the front.
         num_decode = partition(0, num_reqs - 1, 0)
-        # Pass 2: speculative verify windows before prefill/mixed requests.
-        num_windowed = num_decode
+        # Pass 2: full verify windows, then shorter ones, then prefill/mixed.
+        num_full = num_windowed = num_decode
         if num_decode < num_reqs:
-            num_windowed = partition(num_decode, num_reqs - 1, 1)
+            num_full = partition(num_decode, num_reqs - 1, 1)
+        if num_full < num_reqs:
+            num_windowed = partition(num_full, num_reqs - 1, 2)
+        else:
+            num_windowed = num_full
 
         self.input_batch.request_distribution = [
             num_decode, num_windowed, num_reqs
