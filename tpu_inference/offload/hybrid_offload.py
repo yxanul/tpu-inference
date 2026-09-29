@@ -58,14 +58,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import \
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import \
     OffloadingConnector
 from vllm.v1.kv_cache_interface import MambaSpec
-from vllm.v1.kv_offload.base import (GPULoadStoreSpec, LoadStoreSpec,
-                                     LookupResult, OffloadingEvent,
-                                     OffloadingManager, OffloadingSpec,
-                                     OffloadingWorker, OffloadKey,
-                                     PrepareStoreOutput, ReqContext,
-                                     RequestOffloadingContext,
-                                     ScheduleEndContext, TransferResult,
-                                     get_offload_group_idx)
+from vllm.v1.kv_offload.base import (
+    GPULoadStoreSpec, LoadStoreSpec, LookupResult, OffloadingEvent,
+    OffloadingManager, OffloadingSpec, OffloadingWorker, OffloadKey,
+    PrepareStoreOutput, ReqContext, RequestOffloadingContext,
+    ScheduleEndContext, TransferResult, get_offload_group_idx)
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 
@@ -97,11 +94,13 @@ def group_info_from_kv_cache_config(kv_cache_config) -> dict[int, GroupInfo]:
     for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
         spec = group.kv_cache_spec
         is_mamba = isinstance(spec, MambaSpec)
-        if is_mamba:
+        # The TPU pads every layer spec to one page size for vLLM's block
+        # accounting; host slots hold the real (unpadded) bytes.
+        if hasattr(spec, "unpadded_page_size_bytes"):
+            page = spec.unpadded_page_size_bytes
+        else:
             page = dataclasses.replace(spec,
                                        page_size_padded=None).page_size_bytes
-        else:
-            page = spec.page_size_bytes
         info[group_id] = GroupInfo(is_mamba=is_mamba,
                                    bytes_per_block=page *
                                    len(group.layer_names))
@@ -566,6 +565,11 @@ class TPUHybridOffloadingConnector(OffloadingConnector):
         if worker is not None:
             self.connector_worker = TPUOffloadingConnectorWorker(
                 worker.spec, worker.vllm_config, worker.kv_cache_config)
+
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config) -> str | None:
+        # Whole device blocks are copied in the TPU's own layout.
+        return None
 
     def register_runner(self, runner) -> None:
         assert self.connector_worker is not None
