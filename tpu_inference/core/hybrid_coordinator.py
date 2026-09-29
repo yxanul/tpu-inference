@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import inspect
+import os
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -419,6 +420,18 @@ class TPUDualBlockPool(BlockPool):
         return cached_blocks
 
 
+def _pool_stats(pool: BlockPool) -> str:
+    """free/total, cached, cached-but-free (evictable prefix states)."""
+    cached = cached_free = 0
+    for entry in pool.cached_block_hash_to_block._cache.values():
+        blocks = entry.values() if isinstance(entry, dict) else (entry, )
+        for block in blocks:
+            cached += 1
+            cached_free += block.ref_cnt == 0
+    return (f"free={pool.get_num_free_blocks()}/{pool.num_gpu_blocks} "
+            f"cached={cached} cached_free={cached_free}")
+
+
 class TPUHybridKVCacheCoordinator(HybridKVCacheCoordinator):
     """Decoupled KV cache coordinator for hybrid models under Mamba align mode on TPU.
 
@@ -591,6 +604,26 @@ class TPUHybridKVCacheCoordinator(HybridKVCacheCoordinator):
 
         # Re-verify and split groups so attention_groups binds to updated managers
         self.verify_and_split_kv_cache_groups()
+
+    def find_longest_cache_hit(self, block_hashes, max_cache_hit_length):
+        result = super().find_longest_cache_hit(block_hashes,
+                                                max_cache_hit_length)
+        if os.environ.get("TPU_CACHE_DIAG", "0") == "1":
+            _, per_group = self.find_longest_cache_hit_per_group(
+                block_hashes, max_cache_hit_length)
+            attn = [
+                h for g, h in enumerate(per_group)
+                if g not in self.mamba_group_ids
+            ]
+            mamba = [per_group[g] for g in sorted(self.mamba_group_ids)]
+            logger.info(
+                "[cache-diag] max=%d hit=%d attn_hit=%s mamba_hit=%s "
+                "attn_pool=%s mamba_pool=%s", max_cache_hit_length, result[1],
+                min(attn) if attn else None,
+                min(mamba) if mamba else None,
+                _pool_stats(self.attention_block_pool),
+                _pool_stats(self.mamba_block_pool))
+        return result
 
     def can_allocate_tokens(
         self,
