@@ -867,6 +867,12 @@ class _FakePool:
     def cache_partial_block(self, *args, **kwargs):
         return None
 
+    def _maybe_evict_cached_block(self, block):
+        if self.cached_block_hash_to_block.pop(block.block_hash, None) is None:
+            return False
+        block.block_hash = None
+        return True
+
 
 def _make_test_mamba_spec(block_size: int = 256) -> MambaSpec:
     spec = MambaSpec(
@@ -958,6 +964,8 @@ class TestTPUMambaManager:
         request = MagicMock()
         request.request_id = "req1"
         request.num_prompt_tokens = 2048
+        request.num_computed_tokens = 0
+        request.num_tokens = 2048
 
         mgr.cache_blocks(request, 2048)
 
@@ -972,6 +980,8 @@ class TestTPUMambaManager:
         request = MagicMock()
         request.request_id = "req1"
         request.num_prompt_tokens = 2048
+        request.num_computed_tokens = 0
+        request.num_tokens = 2048
 
         mgr.cache_blocks(request, 2048, replay_boundaries=[])
 
@@ -985,6 +995,58 @@ class TestTPUMambaManager:
         assert h7 in pool.cached_block_hash_to_block
         assert pool.cached_block_hash_to_block[h7].block_id == 107
 
+    def test_retains_last_decode_states(self):
+        """With retention_interval=0 only prompt boundaries are kept, plus
+        the last TPU_RETAIN_DECODE_STATES (2) states a decode step wrote."""
+        spec = _make_test_mamba_spec()
+        pool = _FakePool()
+        mgr = _make_test_mamba_manager(spec, pool)
+        mgr.req_to_blocks["req1"] = [_FakeBlock(100 + i) for i in range(8)]
+        request = MagicMock()
+        request.request_id = "req1"
+        request.num_prompt_tokens = 300
+        request.shared_prefix_boundary = 0
+        request.num_computed_tokens = 0
+        request.num_tokens = 300
+        mgr.cache_blocks(request,
+                         300,
+                         retention_interval=0,
+                         replay_boundaries=[299])
+
+        for num_tokens in (512, 768, 1024):
+            request.num_tokens = num_tokens
+            request.num_computed_tokens = num_tokens - 1
+            mgr.cache_blocks(request,
+                             num_tokens,
+                             retention_interval=0,
+                             replay_boundaries=[299])
+
+        cached = pool.cached_block_hash_to_block
+        assert BlockHash(b"hash_1") not in cached  # trimmed: oldest decode
+        assert BlockHash(b"hash_2") in cached
+        assert BlockHash(b"hash_3") in cached
+
+        # A slot re-cached by another request keeps that request's entry.
+        mgr.pop_blocks_for_free("req1")
+        assert BlockHash(b"hash_3") in cached
+
+    def test_decode_states_not_retained_during_prefill(self):
+        spec = _make_test_mamba_spec()
+        pool = _FakePool()
+        mgr = _make_test_mamba_manager(spec, pool)
+        mgr.req_to_blocks["req1"] = [_FakeBlock(100 + i) for i in range(8)]
+        request = MagicMock()
+        request.request_id = "req1"
+        request.num_prompt_tokens = 2048
+        request.shared_prefix_boundary = 0
+        request.num_computed_tokens = 0
+        request.num_tokens = 2048
+        mgr.cache_blocks(request,
+                         1024,
+                         retention_interval=0,
+                         replay_boundaries=[2047])
+        assert not pool.cached_block_hash_to_block
+
     def test_cache_blocks_multiple_chunks(self):
         """Chunked prefill across two passes must only index the end of each pass."""
         spec = _make_test_mamba_spec()
@@ -996,6 +1058,8 @@ class TestTPUMambaManager:
         request = MagicMock()
         request.request_id = "req1"
         request.num_prompt_tokens = 4096
+        request.num_computed_tokens = 0
+        request.num_tokens = 4096
 
         # Pass 1: first 2048 tokens -> checkpoints block 7
         mgr.cache_blocks(request, 2048, replay_boundaries=[])
@@ -1022,6 +1086,8 @@ class TestTPUMambaManager:
         request = MagicMock()
         request.request_id = "req1"
         request.num_prompt_tokens = 2048
+        request.num_computed_tokens = 0
+        request.num_tokens = 2048
         mgr.cache_blocks(request, 2048, replay_boundaries=[])
 
         # A request needing only 512 tokens (blocks 0..1)
@@ -1048,6 +1114,8 @@ class TestTPUMambaManager:
         request = MagicMock()
         request.request_id = "req1"
         request.num_prompt_tokens = 2048
+        request.num_computed_tokens = 0
+        request.num_tokens = 2048
         mgr.cache_blocks(request, 2048, replay_boundaries=[])
 
         hashes = [BlockHash(f"hash_{i}".encode()) for i in range(16)]
@@ -1077,6 +1145,8 @@ class TestTPUMambaManager:
         request = MagicMock()
         request.request_id = "req1"
         request.num_prompt_tokens = 4096
+        request.num_computed_tokens = 0
+        request.num_tokens = 4096
         mgr.cache_blocks(request, 2048, replay_boundaries=[])
         mgr.cache_blocks(request, 4096, replay_boundaries=[])
 

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import collections
 import inspect
+import os
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -262,6 +264,32 @@ class TPUMambaManager(MambaManager):
             self._checkpoint_positions = {}
         if not hasattr(self, "_pending_boundary_state_offloads"):
             self._pending_boundary_state_offloads = []
+        # Keep the last N decode-written states of each request cacheable
+        # (TPU_RETAIN_DECODE_STATES, default 2: with MTP/EAGLE a hit drops
+        # its last block, so the state one block earlier is needed too).
+        self._retain_decode_states = int(
+            os.environ.get("TPU_RETAIN_DECODE_STATES", "2"))
+        self._decode_states: dict[str, collections.deque] = {}
+
+    def _track_decode_state(self, request_id: str,
+                            block: KVCacheBlock) -> None:
+        """Remember a retained decode state; un-cache the oldest one beyond
+        the per-request limit (its slot then counts as uncached-free)."""
+        states = self._decode_states.setdefault(request_id,
+                                                collections.deque())
+        if states and states[-1][0] is block:
+            return
+        states.append((block, block.block_hash))
+        while len(states) > self._retain_decode_states:
+            old, old_hash = states.popleft()
+            # The slot may have been evicted and re-cached for another
+            # request since; only drop the entry this request made.
+            if old.block_hash is not None and old.block_hash == old_hash:
+                self.block_pool._maybe_evict_cached_block(old)
+
+    def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+        self._decode_states.pop(request_id, None)
+        return super().pop_blocks_for_free(request_id)
 
     def cache_blocks(
             self,
@@ -317,6 +345,19 @@ class TPUMambaManager(MambaManager):
                 decode_step or num_cached_blocks + i == written_block_idx
                 for i in range(num_full_blocks - num_cached_blocks)
             ]
+            # Decode-written states (see `_retain_decode_states`): blocks past
+            # the prompt that a decode step completed are kept as well, so an
+            # agent's next turn (prompt + this reply + tool output) resumes
+            # after the reply instead of at the previous prompt boundary.
+            retain_decode = (self._retain_decode_states > 0
+                             and request.num_computed_tokens
+                             >= request.num_tokens - 1)
+            prompt_blocks = request.num_prompt_tokens // self.block_size
+            if retention_mask is not None and retain_decode:
+                retention_mask = [
+                    retained or num_cached_blocks + i >= prompt_blocks
+                    for i, retained in enumerate(retention_mask)
+                ]
             if retention_mask is not None:
                 block_mask = [
                     written and retained
@@ -336,6 +377,8 @@ class TPUMambaManager(MambaManager):
                 block = blocks[idx]
                 if block.is_null or block.block_hash is None:
                     continue
+                if retain_decode and idx >= prompt_blocks:
+                    self._track_decode_state(request_id, block)
                 self.cached_blocks_this_step.add(block.block_hash)
                 if block.block_hash_num_tokens is not None:
                     self._pending_boundary_state_offloads.append(
