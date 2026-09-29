@@ -501,7 +501,8 @@ class TpuPlatform(Platform):
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
             allowed = ("TPUConnector", "TPUConnectorHMA",
-                       "TPUOffloadConnector", "RaidenOffloadConnector")
+                       "TPUOffloadConnector", "RaidenOffloadConnector",
+                       "TPUHybridOffloadingConnector")
             if kv_transfer_config.kv_connector not in allowed:
                 raise ValueError(
                     f"Unsupported kv_connector "
