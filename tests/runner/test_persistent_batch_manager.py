@@ -72,8 +72,9 @@ class MockInputBatch:
     """Lightweight mock InputBatch that tracks the state needed by
     _reorder_batch: req_ids, request_distribution, and swap_states."""
 
-    def __init__(self, req_ids: list[str]):
+    def __init__(self, req_ids: list[str], num_speculative_tokens: int = 0):
         self.max_decode_tokens = 1
+        self.num_speculative_tokens = num_speculative_tokens
         self._req_ids = list(req_ids)
         self.req_id_to_index = {rid: i for i, rid in enumerate(req_ids)}
         self.request_distribution = [0, 0, 0]
@@ -94,7 +95,10 @@ class MockInputBatch:
         self.req_id_to_index[id_j] = j
 
 
-def _create_manager(req_ids, num_scheduled_tokens_map):
+def _create_manager(req_ids,
+                    num_scheduled_tokens_map,
+                    spec_decode_tokens=None,
+                    num_speculative_tokens=0):
     """Helper to create a PersistentBatchManager with a MockInputBatch
     and a mock scheduler_output.
 
@@ -106,7 +110,7 @@ def _create_manager(req_ids, num_scheduled_tokens_map):
     Returns:
         (manager, scheduler_output) tuple.
     """
-    input_batch = MockInputBatch(req_ids)
+    input_batch = MockInputBatch(req_ids, num_speculative_tokens)
 
     manager = PersistentBatchManager(
         requests={},
@@ -121,6 +125,7 @@ def _create_manager(req_ids, num_scheduled_tokens_map):
     scheduler_output.num_scheduled_tokens = num_scheduled_tokens_map
     scheduler_output.total_num_scheduled_tokens = sum(
         num_scheduled_tokens_map.values())
+    scheduler_output.scheduled_spec_decode_tokens = spec_decode_tokens or {}
 
     return manager, scheduler_output
 
@@ -172,6 +177,37 @@ class TestReorderBatch(unittest.TestCase):
         # Last 2 should be prefill requests
         for rid in result_ids[2:]:
             self.assertGreater(num_scheduled[rid], 1)
+
+    def test_spec_decode_windows_ordered_full_then_short(self):
+        """[decode][full verify windows][shorter windows][prefill]: RPA runs
+        full windows with a static query length, and the GDN windowed
+        segment covers every verify window."""
+        req_ids = ["p0", "full0", "dec", "short", "full1", "p1"]
+        num_scheduled = {
+            "p0": 20,
+            "full0": 4,
+            "dec": 1,
+            "short": 2,
+            "full1": 4,
+            "p1": 9
+        }
+        spec = {
+            r: [0] * (num_scheduled[r] - 1)
+            for r in ("full0", "short", "full1")
+        }
+        manager, sched_out = _create_manager(req_ids,
+                                             num_scheduled,
+                                             spec_decode_tokens=spec,
+                                             num_speculative_tokens=3)
+
+        manager._reorder_batch(sched_out)
+
+        ids = manager.input_batch.req_ids
+        self.assertEqual(ids[0], "dec")
+        self.assertEqual(set(ids[1:3]), {"full0", "full1"})
+        self.assertEqual(ids[3], "short")
+        self.assertEqual(set(ids[4:]), {"p0", "p1"})
+        self.assertEqual(manager.input_batch.request_distribution, [1, 4, 6])
 
 
 class TestPersistentBatchManager(unittest.TestCase):
